@@ -2255,7 +2255,10 @@ class MLXMultimodalLM:
 
             msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
             msg_audio_count += len(_msg_audio_inputs.get(msg_idx, []))
-            if msg_text or msg_image_count > 0 or msg_audio_count > 0:
+            tool_calls = msg.get("tool_calls")
+            tool_call_id = msg.get("tool_call_id")
+            has_tool_content = bool(tool_calls) or role == "tool"
+            if msg_text or msg_image_count > 0 or msg_audio_count > 0 or has_tool_content:
                 if role == "user" and (msg_image_count > 0 or msg_audio_count > 0):
                     content_list = []
                     for _ in range(msg_image_count):
@@ -2267,7 +2270,15 @@ class MLXMultimodalLM:
                     )
                     chat_messages.append({"role": role, "content": content_list})
                 elif role == "assistant":
-                    chat_messages.append({"role": role, "content": msg_text})
+                    msg_dict: dict = {"role": role, "content": msg_text}
+                    if tool_calls:
+                        msg_dict["tool_calls"] = tool_calls
+                    chat_messages.append(msg_dict)
+                elif role == "tool":
+                    tool_msg: dict = {"role": "tool", "content": msg_text}
+                    if tool_call_id:
+                        tool_msg["tool_call_id"] = tool_call_id
+                    chat_messages.append(tool_msg)
                 else:
                     chat_messages.append(
                         {

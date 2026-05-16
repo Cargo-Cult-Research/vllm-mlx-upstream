@@ -164,6 +164,12 @@ class Gemma4ToolParser(ToolParser):
     # Ref: llama.cpp PR #21418.
     extra_stop_tokens = ["<|tool_response>"]
 
+    # Gemma4's chat_template.jinja handles role="tool" + tool_calls natively
+    # via OpenAI-style forward-scan, rendering <|tool_response> tokens.
+    # Without this, tool results get converted to "[Tool Result (...)]:" user
+    # messages that the model ignores, causing infinite tool-call loops.
+    SUPPORTS_NATIVE_TOOL_FORMAT = True
+
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
     ) -> ExtractedToolCallInformation:
