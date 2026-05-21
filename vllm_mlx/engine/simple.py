@@ -13,6 +13,7 @@ import os
 import threading
 import time
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import mlx.core as mx
@@ -185,6 +186,16 @@ class SimpleEngine(BaseEngine):
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
 
+        # Single dedicated worker thread for ALL blocking MLX work.
+        # MLX streams are per-thread: an array tagged to a stream on one thread
+        # cannot be read from another. Bouncing across a thread pool causes
+        # "There is no Stream(gpu, N) in current thread" the moment a second
+        # request lands on a different worker. Pinning to one thread makes the
+        # stream affinity question moot — there's only ever one thread.
+        self._mlx_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mlx-worker"
+        )
+
         # System prompt KV cache (reduces repeated prefill across requests)
         self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
         self._system_kv_hash = None  # Hash of system prefix text
@@ -255,15 +266,21 @@ class SimpleEngine(BaseEngine):
             return
         try:
             if self._model is None:
-                if self._uses_default_prepare_for_start():
-                    # MLX generation streams are thread-local. Keep model load on
-                    # the event-loop thread so default LLM stream_generate() runs
-                    # on the same thread that owns model-associated streams.
+                # Load the model on the pinned MLX worker thread so any lazy
+                # state created during construction (e.g. mlx_vlm's
+                # module-level generation_stream side effects, rope._freqs
+                # touched during quantization) ends up tagged to a stream
+                # that the same thread will use at inference time. Loading on
+                # the asyncio event-loop thread and serving from the worker
+                # is the cross-thread mismatch that produces
+                # "no Stream(gpu, N) in current thread".
+                def _do_prepare() -> None:
+                    _bind_worker_generation_streams()
                     self.prepare_for_start()
-                else:
-                    # Test doubles and custom overrides may block; preserve the
-                    # cancellation-safe threaded startup helper for those cases.
-                    await run_blocking_startup_work(self.prepare_for_start)
+
+                await asyncio.wrap_future(
+                    self._mlx_executor.submit(_do_prepare)
+                )
             self._loaded = True
 
             if self._mtp and self._mtp_num_draft_tokens != 1:
@@ -310,8 +327,15 @@ class SimpleEngine(BaseEngine):
                 try:
                     from ..text_model_from_vlm import build_text_model
 
-                    self._text_model = build_text_model(
-                        self._model.model, self._model_name
+                    # Build on the pinned worker so any lazy state created
+                    # during construction (rope._freqs, quantization side
+                    # effects) is born under the same thread that will read it.
+                    def _build_on_worker():
+                        _bind_worker_generation_streams()
+                        return build_text_model(self._model.model, self._model_name)
+
+                    self._text_model = await asyncio.wrap_future(
+                        self._mlx_executor.submit(_build_on_worker)
                     )
 
                     if self._text_model is not None:
@@ -333,6 +357,17 @@ class SimpleEngine(BaseEngine):
                             "(MTP=%s), media -> mlx_vlm",
                             has_mtp and self._mtp,
                         )
+
+                        # Materialize ALL lazy mx.array state on the pinned
+                        # worker thread BEFORE any request lands. Lazy buffers
+                        # (e.g. rope._freqs) get tagged to whichever stream is
+                        # current when first read; if that happens on a request
+                        # thread and the next request lands on a different
+                        # thread, the read fails with "no Stream(gpu, N)".
+                        # Module.parameters() filters out keys starting with
+                        # "_" (mlx/nn/layers/base.py:236), so we walk every
+                        # submodule's __dict__ to catch _freqs and friends.
+                        await self._materialize_text_model_state()
                     else:
                         self._text_model = None
                         self._text_tokenizer = None
@@ -397,6 +432,7 @@ class SimpleEngine(BaseEngine):
         self._system_kv_hash = None
         self._system_kv_token_count = 0
         self._supports_system_kv_cache = False
+        self._mlx_executor.shutdown(wait=False, cancel_futures=True)
         logger.info("SimpleEngine stopped")
 
     def _should_route_text_through_text_model(
@@ -404,6 +440,37 @@ class SimpleEngine(BaseEngine):
     ) -> bool:
         """Return whether text-only MLLM requests may use mlx_lm TextModel."""
         return not (mllm_draft_requested and self._mllm_draft_model_path is not None)
+
+    async def _materialize_text_model_state(self) -> None:
+        """Eagerly evaluate every mx.array in the text model on the pinned worker.
+
+        Catches both regular parameters and underscore-prefixed buffers (e.g.
+        ``rope._freqs``) that ``Module.parameters()`` filters out. Runs on the
+        same thread that will later serve every request, so the resulting
+        stream affinity matches at request time.
+        """
+
+        def _do_materialize() -> int:
+            _bind_worker_generation_streams()
+            arrays: list = []
+            seen: set[int] = set()
+            # nn.Module is a dict subclass; attributes assigned via __setattr__
+            # go into the dict (see mlx/nn/layers/base.py:105). Walking .items()
+            # surfaces everything including underscore-prefixed buffers
+            # (e.g. rope._freqs) that Module.parameters() filters out.
+            for module in self._text_model.modules():
+                for value in module.values():
+                    if isinstance(value, mx.array) and id(value) not in seen:
+                        seen.add(id(value))
+                        arrays.append(value)
+            if arrays:
+                mx.eval(arrays)
+            return len(arrays)
+
+        n = await asyncio.wrap_future(self._mlx_executor.submit(_do_materialize))
+        logger.info(
+            "Materialized %d mx.array tensors on pinned MLX worker thread", n
+        )
 
     async def _run_blocking_serialized(self, func, /, *args, on_cancel=None, **kwargs):
         """Run a blocking MLX operation under the generation lock.
@@ -418,7 +485,7 @@ class SimpleEngine(BaseEngine):
                 _bind_worker_generation_streams()
                 return func(*args, **kwargs)
 
-            task = asyncio.create_task(asyncio.to_thread(run_bound))
+            task = asyncio.wrap_future(self._mlx_executor.submit(run_bound))
             try:
                 return await asyncio.shield(task)
             except asyncio.CancelledError:
