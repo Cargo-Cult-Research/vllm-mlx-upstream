@@ -1036,15 +1036,29 @@ class MLLMBatchGenerator:
                 layer_cache.keys = layer_cache._trim(trim_size, layer_cache.keys)
                 layer_cache.values = layer_cache._trim(trim_size, layer_cache.values)
                 layer_cache._idx = layer_cache.max_size
-            layer_cache.offset = min(layer_cache.offset, layer_cache.max_size)
-            # Defensive: ensure size() <= keys.shape[2] to prevent merge crash.
-            # Prefix cache trimming can create offset > keys.shape[2] when
-            # a supersequence/LCP trim crosses the max_size boundary.
+            # NOTE: do NOT clamp offset to max_size. RotatingKVCache.offset is
+            # the absolute token position counter (not a buffer index); the
+            # next-token RoPE depends on it being the true number of tokens
+            # processed. Clamping to max_size silently rewinds RoPE positions
+            # when prefill > sliding_window and produces degenerate generation
+            # (token loops on Gemma 4 at prompts ≥ ~1.3k tokens).
+            # An earlier version clamped here to dodge a crash in
+            # RotatingKVCache._update_in_place when ``prev > max_size`` and the
+            # buffer hadn't been trimmed yet; the trim above (buf_len >
+            # max_size) is what actually fixes that, and the clamp was
+            # collateral damage. See tests/test_gemma4_batched_tool_loop.py.
+            #
+            # Defensive guard kept: if the buffer is short of max_size AND
+            # offset > buffer length (only possible from a prefix-cache
+            # supersequence/LCP trim crossing the max_size boundary), clamp
+            # offset to buffer length so size() doesn't claim more tokens than
+            # exist. This branch does NOT fire on fresh prefill, where the
+            # branch above already filled the buffer to max_size.
             buf_len = layer_cache.keys.shape[2]
-            if min(layer_cache.offset, layer_cache.max_size) > buf_len:
+            if buf_len < layer_cache.max_size and layer_cache.offset > buf_len:
                 logger.warning(
                     f"RotatingKVCache offset ({layer_cache.offset}) > "
-                    f"buffer ({buf_len}), capping to buffer size"
+                    f"short buffer ({buf_len}), capping to buffer size"
                 )
                 layer_cache.offset = buf_len
 

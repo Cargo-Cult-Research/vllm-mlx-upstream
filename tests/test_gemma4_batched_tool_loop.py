@@ -208,3 +208,94 @@ def test_tool_result_followup_does_not_loop(gemma_url):
         f"a generation loop. content[:300]={content[:300]!r} "
         f"reasoning[:300]={reasoning[:300]!r}"
     )
+
+
+def test_tool_result_followup_does_not_loop_past_sliding_window(gemma_url):
+    """The harder case: tool result that pushes prompt past Gemma 4's
+    sliding-window cap (1024 tokens) and the sliding RotatingKVCache must
+    rotate during prefill.
+
+    A prior version of ``_trim_rotating_caches`` clamped
+    ``RotatingKVCache.offset`` to ``max_size`` before merging caches into
+    ``BatchRotatingKVCache``. ``offset`` is the absolute token-position
+    counter (not a buffer index), so clamping it silently rewound the RoPE
+    position seen by the next generated token from ~1700 back to 1024 —
+    queries and cached keys then sat in different rotary coordinate
+    systems and decode produced sentence-level loops drawn from prompt
+    tokens. This test guards against that regression.
+    """
+    long_files = [f"file_{i:04d}.txt" for i in range(250)] + ["asitop_test.log"]
+    long_result = "\n".join(long_files)
+
+    payload = {
+        "model": DEFAULT_MODEL,
+        "max_tokens": 256,
+        "temperature": 0.0,
+        "tools": [TOOL],
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Are any files relating to asitop in /tmp? Answer in one sentence."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_long",
+                        "type": "function",
+                        "function": {
+                            "name": "list_files",
+                            "arguments": '{"path":"/tmp"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_long",
+                "content": long_result,
+            },
+        ],
+    }
+
+    r = _chat(gemma_url, DEFAULT_MODEL, payload)
+    choice = r["choices"][0]
+    msg = choice["message"]
+    fr = choice["finish_reason"]
+    ptok = r.get("usage", {}).get("prompt_tokens", 0)
+    content = msg.get("content") or ""
+    reasoning = msg.get("reasoning_content") or ""
+
+    # Sanity: prompt must be longer than Gemma 4's sliding window (1024) for
+    # this test to actually exercise the cache-rotation path.
+    assert ptok > 1024, (
+        f"Test prompt is only {ptok} tokens — needs to exceed Gemma 4's "
+        "sliding window (1024) to hit the cache-rotation path being tested."
+    )
+
+    content_loop, content_why = _looks_like_token_loop(content)
+    reason_loop, reason_why = _looks_like_token_loop(reasoning)
+
+    assert not content_loop, (
+        f"content loop at ptok={ptok} ({content_why}). "
+        f"finish={fr}. content[:300]={content[:300]!r}"
+    )
+    assert not reason_loop, (
+        f"reasoning loop at ptok={ptok} ({reason_why}). "
+        f"finish={fr}. reasoning[:300]={reasoning[:300]!r}"
+    )
+    assert fr != "length", (
+        f"Hit max_tokens at ptok={ptok} for a one-sentence answer — loop "
+        f"likely. content[:300]={content[:300]!r} reasoning[:300]={reasoning[:300]!r}"
+    )
+    # Coherence check: the model should reference the planted "asitop"
+    # filename or at minimum produce a yes/no answer. Looping outputs
+    # like ``file_15.txt file_15.txt …`` will fail this.
+    haystack = (content + " " + reasoning).lower()
+    assert "asitop" in haystack or "no" in haystack.split()[:5] or "yes" in haystack.split()[:5], (
+        f"Output does not reference 'asitop' or contain a yes/no — possible "
+        f"loop. content[:300]={content[:300]!r} reasoning[:300]={reasoning[:300]!r}"
+    )
