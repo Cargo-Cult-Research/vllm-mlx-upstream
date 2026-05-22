@@ -5615,11 +5615,20 @@ async def _stream_anthropic_messages(
         # Determine stop reason
         stop_reason = "tool_use" if tool_calls else "end_turn"
 
-        # Emit message_delta with stop_reason and usage
+        # Emit message_delta with stop_reason and usage.
+        # message_start was emitted with input_tokens=0 (we don't know the
+        # prompt size before stream_chat starts), so the final input_tokens
+        # is provided here in message_delta. Anthropic clients sum the two
+        # usage blocks — Claude Agent SDK in particular surfaces this as
+        # modelUsage[*].inputTokens, which downstream agents use for context-
+        # size accounting (see nanoclaw container poll-loop byline counter).
         message_delta = {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": completion_tokens},
+            "usage": {
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+            },
         }
         yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
 
