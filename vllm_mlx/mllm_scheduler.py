@@ -307,6 +307,13 @@ class MLLMScheduler:
                     kv_group_size=self.config.kv_cache_quantization_group_size,
                 )
 
+            tokenizer = (
+                self.processor.tokenizer
+                if hasattr(self.processor, "tokenizer")
+                else self.processor
+            )
+            model_path = getattr(tokenizer, "name_or_path", None)
+
             self.batch_generator = MLLMBatchGenerator(
                 model=self.model,
                 processor=self.processor,
@@ -319,6 +326,7 @@ class MLLMScheduler:
                 prefill_step_size=self.config.prefill_step_size,
                 prefix_cache_config=prefix_cache_config,
                 max_kv_size=self.config.max_kv_size,
+                model_path=model_path,
             )
 
             # Install chunked prefill BEFORE MTP (MTP wraps _next,

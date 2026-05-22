@@ -414,6 +414,7 @@ class MLLMBatchGenerator:
         vision_cache_size: int = 100,
         prefix_cache_config: Optional[MemoryCacheConfig] = None,
         max_kv_size: int = 0,
+        model_path: Optional[str] = None,
     ):
         """
         Initialize MLLM batch generator.
@@ -460,6 +461,30 @@ class MLLMBatchGenerator:
         patch_qwen35_attention_for_batching()
         patch_gemma4_attention_for_batching()
         patch_glm4v_moe_for_batching()
+
+        # Route text-only Gemma 4 / Qwen 3.5 requests through mlx_lm.TextModel
+        # (built via text_model_from_vlm with weight sharing — zero extra VRAM).
+        # The mlx-vlm language modules diverge from mlx_lm on MoE routing and
+        # attention call ordering; on long prompts (≈1.5k+ tokens) the mlx-vlm
+        # path produces degenerate token loops under BatchedEngine even with
+        # batch=1 and no chunking. See tests/test_gemma4_batched_tool_loop.py.
+        self._text_model = None
+        if self.is_vlm and model_path:
+            try:
+                from .text_model_from_vlm import build_text_model
+
+                self._text_model = build_text_model(model, model_path)
+                if self._text_model is not None:
+                    logger.info(
+                        "MLLMBatchGenerator: text-only requests routed through "
+                        "mlx_lm TextModel (weights shared with VLM language_model)"
+                    )
+                    self.language_model = self._text_model
+            except Exception as e:
+                logger.warning(
+                    f"MLLMBatchGenerator: text_model build failed ({type(e).__name__}: {e}); "
+                    f"falling back to VLM language_model"
+                )
 
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()
