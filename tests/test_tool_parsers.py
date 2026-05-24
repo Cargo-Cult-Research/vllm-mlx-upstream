@@ -949,6 +949,93 @@ class TestQwen3CoderParser:
         assert result.tool_calls[1]["name"] == "list_files"
 
 
+class TestQwen36HybridFormat:
+    """Tolerance for qwen36's malformed tool-call output.
+
+    Qwen 3.6-35B-A3B sometimes emits the function name as a
+    ``<parameter=name>`` tag instead of as a ``<function=NAME>``
+    opener, and closes with bare ``</function>`` (no ``</tool_call>``).
+    The parser normalizes this to the canonical Qwen 3.5 XML form
+    before parsing — observed in the wild when the session has no
+    prior tool-call examples in its context window.
+    """
+
+    def _parser(self):
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import Qwen3XMLToolParser
+
+        return Qwen3XMLToolParser()
+
+    def test_hybrid_exact_qwen36_output(self):
+        """The literal output we saw from qwen36 on a fresh session."""
+        parser = self._parser()
+        text = (
+            "<tool_call>\n"
+            "<parameter=name>\n"
+            "Read\n"
+            "</parameter>\n"
+            "<parameter=file_path>\n"
+            "/workspace/extra/housekeeping/backlog.md\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called, "hybrid format should be recognized"
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "Read"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["file_path"].strip() == "/workspace/extra/housekeeping/backlog.md"
+
+    def test_hybrid_inline_no_newlines(self):
+        """Same hybrid pattern but without the newlines qwen36 inserted."""
+        parser = self._parser()
+        text = (
+            "<tool_call>"
+            "<parameter=name>get_weather</parameter>"
+            "<parameter=city>Berlin</parameter>"
+            "</function>"
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["city"] == "Berlin"
+
+    def test_canonical_form_unchanged(self):
+        """Canonical Qwen 3.5 XML must pass through unchanged."""
+        parser = self._parser()
+        text = (
+            "<tool_call>\n"
+            "<function=read_file>\n"
+            "<parameter=path>/src/main.py</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "read_file"
+
+    def test_normalize_idempotent_on_hybrid(self):
+        """Calling _normalize twice yields the same output as once."""
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import Qwen3XMLToolParser
+
+        text = (
+            "<tool_call>"
+            "<parameter=name>foo</parameter>"
+            "<parameter=arg>bar</parameter>"
+            "</function>"
+        )
+        once = Qwen3XMLToolParser._normalize_qwen36_hybrid(text)
+        twice = Qwen3XMLToolParser._normalize_qwen36_hybrid(once)
+        assert once == twice
+
+    def test_no_tool_call_wrapper_passthrough(self):
+        """Plain text without <tool_call> must be returned unchanged."""
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import Qwen3XMLToolParser
+
+        text = "just regular content, no tool calls here"
+        assert Qwen3XMLToolParser._normalize_qwen36_hybrid(text) == text
+
+
 class TestHermesStreamingFixes:
     """Test streaming fixes for Hermes parser (Issue #47)."""
 

@@ -1308,6 +1308,65 @@ class Qwen3XMLToolParser(ToolParser):
             return [_ToolDef(t) for t in request["tools"]]
         return None
 
+    @staticmethod
+    def _normalize_qwen36_hybrid(text: str) -> str:
+        """Rewrite qwen36's hybrid tool-call format to canonical Qwen 3.5 XML.
+
+        Qwen 3.6-35B-A3B-4bit MoE sometimes emits the function name as a
+        ``<parameter=name>`` tag inside ``<tool_call>`` instead of as a
+        ``<function=NAME>`` opener, and closes with a bare ``</function>``
+        (no matching ``</tool_call>``):
+
+            <tool_call>
+            <parameter=name>read_file</parameter>
+            <parameter=path>/src/main.py</parameter>
+            </function>
+
+        This rewrites to the canonical form so the rest of the parser is
+        unchanged:
+
+            <tool_call>
+            <function=read_file>
+            <parameter=path>/src/main.py</parameter>
+            </function>
+            </tool_call>
+
+        No-op on canonical input or any input lacking ``<tool_call>``.
+        """
+        if "<tool_call>" not in text:
+            return text
+
+        # Promote the first <parameter=name>NAME</parameter> after each
+        # <tool_call> to <function=NAME>. Only matches when no
+        # <function=...> opener intervenes (negative-lookahead-like via
+        # non-greedy <parameter=name> match).
+        promoted, n_subs = re.subn(
+            r"<tool_call>(\s*)<parameter=name>\s*([^<]+?)\s*</parameter>",
+            lambda m: f"<tool_call>{m.group(1)}<function={m.group(2).strip()}>",
+            text,
+            flags=re.DOTALL,
+        )
+        if n_subs == 0:
+            return text  # canonical input — nothing to do.
+
+        # Balance unclosed <tool_call> blocks. Each promotion left a
+        # </function> that no longer has a matching </tool_call>; append
+        # one after each such </function> until counts balance.
+        open_tc = promoted.count("<tool_call>")
+        close_tc = promoted.count("</tool_call>")
+        while open_tc > close_tc:
+            promoted, n = re.subn(
+                r"</function>(?!\s*</tool_call>)",
+                "</function>\n</tool_call>",
+                promoted,
+                count=1,
+            )
+            if n == 0:
+                break  # malformed — give up rather than spin.
+            close_tc += 1
+
+        return promoted
+
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
     ) -> ExtractedToolCallInformation:
@@ -1316,6 +1375,9 @@ class Qwen3XMLToolParser(ToolParser):
         # (Reasoning parser should have already stripped them, but
         # this guards against non-streaming paths or missing parser.)
         cleaned = self.strip_think_tags(model_output)
+        # Tolerate qwen36's hybrid format (name as a <parameter=> tag,
+        # closing </function> without </tool_call>).
+        cleaned = self._normalize_qwen36_hybrid(cleaned)
 
         self._xml_parser.reset_streaming_state()
         tools = self._wrap_tools(request)
