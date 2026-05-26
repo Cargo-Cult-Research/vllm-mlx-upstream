@@ -1309,6 +1309,61 @@ class Qwen3XMLToolParser(ToolParser):
         return None
 
     @staticmethod
+    def _normalize_qwen36_bare_function(text: str) -> str:
+        """Rewrite qwen36's bare-function-element variant to canonical XML.
+
+        Observed in qwen36 cold-session output (2026-05-26):
+
+            <Read>
+            <parameter=file_path>/path</parameter>
+            </function>
+            </tool_call>
+
+        The function name is encoded as the bare opening element name
+        (`<Read>`) instead of `<function=Read>`, and there is no
+        `<tool_call>` opener. Closing tags `</function>` and `</tool_call>`
+        do appear.
+
+        Heuristic: if the text contains `</function>` followed by
+        `</tool_call>` but does NOT contain `<tool_call>` (opener) and
+        does NOT contain `<function=` (canonical opener), look for the
+        first `<NAME>` element before a `<parameter=` block and rewrite:
+
+            <tool_call>
+            <function=NAME>
+            ...same body...
+            </function>
+            </tool_call>
+
+        Safe because the trigger conditions are specific — generic
+        markup like `<p>foo</p>` won't match because there's no
+        `</function></tool_call>` pair.
+        """
+        # Trigger condition: closing tags present, opening tags absent.
+        if "</function>" not in text or "</tool_call>" not in text:
+            return text
+        if "<tool_call>" in text or "<function=" in text:
+            return text  # one of the other normalizers (or canonical) will handle.
+
+        # Find the first <NAME> element that immediately precedes a
+        # <parameter= block (allow whitespace between).
+        m = re.search(
+            r"<([A-Za-z_]\w*)>\s*<parameter=",
+            text,
+        )
+        if not m:
+            return text  # bare-function pattern not found.
+        name = m.group(1)
+        # Replace the <NAME> opener with <function=NAME>.
+        rewritten = (
+            text[: m.start()]
+            + f"<function={name}>"
+            + text[m.start() + len(f"<{name}>") :]
+        )
+        # Prepend <tool_call> so the parser engages.
+        return f"<tool_call>\n{rewritten}"
+
+    @staticmethod
     def _normalize_qwen36_anthropic_xml(text: str) -> str:
         """Rewrite Anthropic-flavor tool-call XML to canonical Qwen 3.5 XML.
 
@@ -1409,14 +1464,17 @@ class Qwen3XMLToolParser(ToolParser):
         # (Reasoning parser should have already stripped them, but
         # this guards against non-streaming paths or missing parser.)
         cleaned = self.strip_think_tags(model_output)
-        # Tolerate two observed qwen36 cold-session variants by normalizing
-        # to canonical Qwen 3.5 XML before parsing:
+        # Tolerate three observed qwen36 cold-session variants by normalizing
+        # to canonical Qwen 3.5 XML before parsing. Order matters — each
+        # normalizer assumes the trigger conditions earlier ones didn't fix.
         # (1) Anthropic-flavor <tool_calls><invoke name="..."> — rewrite
-        #     to <tool_call><function=...> first since hybrid normalizer
-        #     keys on <tool_call> singular.
-        # (2) hybrid <tool_call><parameter=name>NAME</parameter>... that
+        #     to <tool_call><function=...>.
+        # (2) Bare-function-element <NAME>...</function></tool_call> with no
+        #     <tool_call> opener and no <function=> — synthesize wrapper.
+        # (3) hybrid <tool_call><parameter=name>NAME</parameter>... that
         #     omits the <function=...> opener.
         cleaned = self._normalize_qwen36_anthropic_xml(cleaned)
+        cleaned = self._normalize_qwen36_bare_function(cleaned)
         cleaned = self._normalize_qwen36_hybrid(cleaned)
 
         self._xml_parser.reset_streaming_state()

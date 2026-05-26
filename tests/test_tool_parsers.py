@@ -1098,6 +1098,43 @@ class TestQwen36HybridFormat:
         text = "the user said: <tool_call><function=foo></function></tool_call>"
         assert Qwen3XMLToolParser._normalize_qwen36_anthropic_xml(text) == text
 
+    def test_bare_function_variant_exact_wire(self):
+        """Wire-observed output from qwen36 on 2026-05-26 tick 489.
+
+        Function name encoded as bare opening element, no <tool_call> opener.
+        """
+        parser = self._parser()
+        text = (
+            "<Read>\n"
+            "<parameter=file_path>\n"
+            "/workspace/extra/housekeeping/backlog.md\n"
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "Read"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["file_path"].strip() == "/workspace/extra/housekeeping/backlog.md"
+
+    def test_bare_function_passthrough_canonical(self):
+        """Canonical form must NOT be rewritten by the bare-function normalizer."""
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import Qwen3XMLToolParser
+
+        text = (
+            "<tool_call>\n<function=foo>\n<parameter=x>1</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        assert Qwen3XMLToolParser._normalize_qwen36_bare_function(text) == text
+
+    def test_bare_function_passthrough_no_closing_pair(self):
+        """Markup without the </function></tool_call> close must be untouched."""
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import Qwen3XMLToolParser
+
+        text = "<p>just a paragraph</p><parameter=foo>bar</parameter>"
+        assert Qwen3XMLToolParser._normalize_qwen36_bare_function(text) == text
+
 
 class TestHermesStreamingFixes:
     """Test streaming fixes for Hermes parser (Issue #47)."""
