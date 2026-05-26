@@ -1309,6 +1309,40 @@ class Qwen3XMLToolParser(ToolParser):
         return None
 
     @staticmethod
+    def _normalize_qwen36_anthropic_xml(text: str) -> str:
+        """Rewrite Anthropic-flavor tool-call XML to canonical Qwen 3.5 XML.
+
+        Observed in qwen36 cold-session output (2026-05-26):
+
+            <tool_calls>
+            <invoke name="Read">
+            <parameter=file_path>/path</parameter>
+            </function>
+
+        Anthropic-style XML uses ``<tool_calls>`` plural and
+        ``<invoke name="...">``; canonical Qwen 3.5 uses ``<tool_call>``
+        singular and ``<function=NAME>``. Without this normalization the
+        parser sees no ``<tool_call>`` and never engages.
+
+        Mapping (idempotent on canonical input):
+        - ``<tool_calls>`` → ``<tool_call>``
+        - ``</tool_calls>`` → ``</tool_call>``
+        - ``<invoke name="X">`` → ``<function=X>``
+        - ``</invoke>`` → ``</function>``
+        """
+        if "<tool_calls>" not in text and "<invoke name=" not in text:
+            return text
+        text = re.sub(r"<tool_calls>", "<tool_call>", text)
+        text = re.sub(r"</tool_calls>", "</tool_call>", text)
+        text = re.sub(
+            r'<invoke\s+name="([^"]+)"\s*>',
+            lambda m: f"<function={m.group(1)}>",
+            text,
+        )
+        text = re.sub(r"</invoke>", "</function>", text)
+        return text
+
+    @staticmethod
     def _normalize_qwen36_hybrid(text: str) -> str:
         """Rewrite qwen36's hybrid tool-call format to canonical Qwen 3.5 XML.
 
@@ -1375,8 +1409,14 @@ class Qwen3XMLToolParser(ToolParser):
         # (Reasoning parser should have already stripped them, but
         # this guards against non-streaming paths or missing parser.)
         cleaned = self.strip_think_tags(model_output)
-        # Tolerate qwen36's hybrid format (name as a <parameter=> tag,
-        # closing </function> without </tool_call>).
+        # Tolerate two observed qwen36 cold-session variants by normalizing
+        # to canonical Qwen 3.5 XML before parsing:
+        # (1) Anthropic-flavor <tool_calls><invoke name="..."> — rewrite
+        #     to <tool_call><function=...> first since hybrid normalizer
+        #     keys on <tool_call> singular.
+        # (2) hybrid <tool_call><parameter=name>NAME</parameter>... that
+        #     omits the <function=...> opener.
+        cleaned = self._normalize_qwen36_anthropic_xml(cleaned)
         cleaned = self._normalize_qwen36_hybrid(cleaned)
 
         self._xml_parser.reset_streaming_state()

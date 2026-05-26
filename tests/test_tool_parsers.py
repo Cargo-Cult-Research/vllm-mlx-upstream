@@ -1035,6 +1035,69 @@ class TestQwen36HybridFormat:
         text = "just regular content, no tool calls here"
         assert Qwen3XMLToolParser._normalize_qwen36_hybrid(text) == text
 
+    def test_anthropic_xml_variant_exact_wire(self):
+        """Wire-observed output from qwen36 on 2026-05-26 ticks 469/487.
+
+        Anthropic-flavor: <tool_calls> plural, <invoke name="X">, missing
+        </tool_calls>, dangling </function>.
+        """
+        parser = self._parser()
+        text = (
+            "<tool_calls>\n"
+            '<invoke name="Read">\n'
+            "<parameter=file_path>\n"
+            "/workspace/extra/housekeeping/backlog.md\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called, "anthropic-flavor format should be recognized"
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "Read"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["file_path"].strip() == "/workspace/extra/housekeeping/backlog.md"
+
+    def test_anthropic_xml_complete_form(self):
+        """Anthropic-flavor with proper closing tags also works."""
+        parser = self._parser()
+        text = (
+            "<tool_calls>\n"
+            '<invoke name="get_weather">\n'
+            "<parameter=city>Berlin</parameter>\n"
+            "</invoke>\n"
+            "</tool_calls>"
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["city"] == "Berlin"
+
+    def test_anthropic_xml_normalizer_idempotent(self):
+        """Running the anthropic-xml normalizer twice produces the same output."""
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import Qwen3XMLToolParser
+
+        text = (
+            "<tool_calls>"
+            '<invoke name="foo">'
+            "<parameter=arg>bar</parameter>"
+            "</invoke>"
+            "</tool_calls>"
+        )
+        once = Qwen3XMLToolParser._normalize_qwen36_anthropic_xml(text)
+        twice = Qwen3XMLToolParser._normalize_qwen36_anthropic_xml(once)
+        assert once == twice
+        assert "<tool_call>" in once
+        assert "<function=foo>" in once
+        assert "</tool_call>" in once
+
+    def test_anthropic_xml_passthrough_when_unrelated(self):
+        """Text lacking both tool_calls (plural) and invoke must be untouched."""
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import Qwen3XMLToolParser
+
+        text = "the user said: <tool_call><function=foo></function></tool_call>"
+        assert Qwen3XMLToolParser._normalize_qwen36_anthropic_xml(text) == text
+
 
 class TestHermesStreamingFixes:
     """Test streaming fixes for Hermes parser (Issue #47)."""
