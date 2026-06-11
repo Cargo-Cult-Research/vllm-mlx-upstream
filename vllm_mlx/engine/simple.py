@@ -362,16 +362,12 @@ class SimpleEngine(BaseEngine):
 
                         from ..utils.tokenizer import collect_eos_token_ids
 
-                        eos_ids = collect_eos_token_ids(
-                            raw_tokenizer, self._model_name
-                        )
+                        eos_ids = collect_eos_token_ids(raw_tokenizer, self._model_name)
                         self._text_tokenizer = TokenizerWrapper(
                             raw_tokenizer,
                             eos_token_ids=eos_ids or None,
                         )
-                        logger.info(
-                            "Text route stop tokens: %s", sorted(eos_ids)
-                        )
+                        logger.info("Text route stop tokens: %s", sorted(eos_ids))
 
                         has_mtp = (
                             hasattr(self._text_model, "mtp")
