@@ -665,51 +665,89 @@ class SimpleEngine(BaseEngine):
                     return
 
         async with self._generation_lock:
-            # Non-stream chat runs in a worker thread and rebinds generation
-            # streams there. Rebind again on the current thread before
-            # stream_generate so nonstream->stream mode switches remain valid.
-            _bind_worker_generation_streams()
+            # Produce on the dedicated MLX worker thread and bridge chunks
+            # through a queue (same idiom as the stream_chat KV-cache branch
+            # and the MLLM text route). Iterating the blocking generator on
+            # the event-loop thread evaluates graphs whose streams live on
+            # mlx-worker (model load and every serialized call run there) and
+            # dies with "There is no Stream(gpu, N) in current thread" — the
+            # KV-cache branch streams via the worker, so only this uncached
+            # fallback was affected. First hit by gpt-oss-120b, whose
+            # RotatingKVCache always disqualifies the cache branch.
+            loop = asyncio.get_running_loop()
+            response_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+            def _emit(kind: str, payload: Any) -> None:
+                loop.call_soon_threadsafe(response_queue.put_nowait, (kind, payload))
+
+            def _produce() -> None:
+                _bind_worker_generation_streams()
+                try:
+                    for chunk in self._model.stream_generate(
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop=stop,
+                        **kwargs,
+                    ):
+                        _emit("resp", chunk)
+                except BaseException as exc:
+                    _emit("error", exc)
+                else:
+                    _emit("done", None)
+
+            producer = self._mlx_executor.submit(_produce)
 
             accumulated_text = ""
             prompt_tokens = 0
             completion_tokens = 0
             finished = False
 
-            for chunk in self._model.stream_generate(
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                stop=stop,
-                **kwargs,
-            ):
-                prompt_tokens = (
-                    chunk.prompt_tokens
-                    if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
-                    else prompt_tokens
-                )
-                completion_tokens += 1
-                new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                accumulated_text += new_text
+            try:
+                while True:
+                    kind, payload = await response_queue.get()
+                    if kind == "done":
+                        break
+                    if kind == "error":
+                        raise payload
+                    chunk = payload
 
-                finished = (
-                    getattr(chunk, "finished", False) or completion_tokens >= max_tokens
-                )
-                finish_reason = None
-                if finished:
-                    finish_reason = getattr(chunk, "finish_reason", "stop")
+                    prompt_tokens = (
+                        chunk.prompt_tokens
+                        if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
+                        else prompt_tokens
+                    )
+                    completion_tokens += 1
+                    new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                    accumulated_text += new_text
 
-                yield GenerationOutput(
-                    text=accumulated_text,
-                    new_text=new_text,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    finished=finished,
-                    finish_reason=finish_reason,
-                )
+                    finished = (
+                        getattr(chunk, "finished", False)
+                        or completion_tokens >= max_tokens
+                    )
+                    finish_reason = None
+                    if finished:
+                        finish_reason = getattr(chunk, "finish_reason", "stop")
 
-                if finished:
-                    break
+                    yield GenerationOutput(
+                        text=accumulated_text,
+                        new_text=new_text,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        finished=finished,
+                        finish_reason=finish_reason,
+                    )
+
+                    if finished:
+                        break
+            finally:
+                # Don't release the generation lock while the worker is still
+                # decoding (consumer bailed early on `finished` or was
+                # cancelled) — a follow-up request would enter MLX/Metal
+                # concurrently. The underlying generator stops at max_tokens
+                # or EOS, so this wait is bounded.
+                await asyncio.wrap_future(producer)
 
             if not finished:
                 if prompt_tokens == 0:
@@ -732,6 +770,7 @@ class SimpleEngine(BaseEngine):
         tools: list[dict] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        clean_output: bool = True,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -745,6 +784,13 @@ class SimpleEngine(BaseEngine):
             tools: Optional tool definitions
             images: Optional image URLs/paths
             videos: Optional video URLs/paths
+            clean_output: Strip special tokens from the returned text
+                (clean_output_text). Server handlers that run reasoning /
+                tool-call parsers afterwards must pass False: the GPT-OSS
+                harmony branch of clean_output_text flattens the channel
+                structure those parsers need (analysis text and commentary
+                tool calls end up fused into content). The server cleans
+                post-parse; direct engine consumers keep the default.
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -769,7 +815,11 @@ class SimpleEngine(BaseEngine):
                 **kwargs,
             ):
                 final_output = output
-            text = clean_output_text(final_output.text)
+            text = (
+                clean_output_text(final_output.text)
+                if clean_output
+                else final_output.text
+            )
             return GenerationOutput(
                 text=text,
                 tokens=list(final_output.tokens),
@@ -807,7 +857,7 @@ class SimpleEngine(BaseEngine):
                 tools=template_tools,
                 **kwargs,
             )
-            text = clean_output_text(output.text)
+            text = clean_output_text(output.text) if clean_output else output.text
             return GenerationOutput(
                 text=text,
                 prompt_tokens=output.prompt_tokens,
@@ -827,7 +877,7 @@ class SimpleEngine(BaseEngine):
                 chat_template_kwargs=chat_template_kwargs,
                 **kwargs,
             )
-            text = clean_output_text(output.text)
+            text = clean_output_text(output.text) if clean_output else output.text
             # Preserve upstream prompt accounting while routing the blocking
             # chat call through the cancellation-safe serialized runner.
             tokenizer = self._model.tokenizer

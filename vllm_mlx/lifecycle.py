@@ -417,9 +417,19 @@ class ResidencyManager:
 
         uses_default_prepare = getattr(engine, "_uses_default_prepare_for_start", None)
         if callable(uses_default_prepare) and uses_default_prepare():
-            # Keep default engine prepare on the event-loop thread so MLX
-            # thread-local stream ownership matches subsequent streaming calls.
-            prepare_for_start()
+            # Load on the engine's pinned MLX worker thread — generation runs
+            # there (SimpleEngine routes all MLX work through _mlx_executor),
+            # so lazy state created during load must be tagged to that same
+            # thread's streams. Loading on the event-loop thread and serving
+            # from the worker is the cross-thread mismatch that produces
+            # "no Stream(gpu, N) in current thread". (The previous version of
+            # this branch assumed streaming ran on the event-loop thread;
+            # that hasn't been true since generation moved to the worker.)
+            executor = getattr(engine, "_mlx_executor", None)
+            if executor is not None:
+                await asyncio.wrap_future(executor.submit(prepare_for_start))
+            else:
+                prepare_for_start()
             return
 
         prepare_task = asyncio.create_task(asyncio.to_thread(prepare_for_start))
