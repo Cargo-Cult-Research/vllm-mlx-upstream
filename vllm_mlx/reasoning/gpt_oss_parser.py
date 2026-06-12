@@ -26,7 +26,7 @@ _STRUCTURAL_TOKENS = re.compile(
 #   <|channel|>final<|message|>
 #   <|channel|>final <|constrain|>JSON<|message|>
 _CHANNEL_RE = re.compile(
-    r"<\|channel\|>(analysis|final)(?:[^<]*(?:<\|constrain\|>[^<]*)?)?<\|message\|>"
+    r"<\|channel\|>(analysis|final|commentary)(?:[^<]*(?:<\|constrain\|>[^<]*)?)?<\|message\|>"
 )
 
 
@@ -99,6 +99,18 @@ class GptOssReasoningParser(ReasoningParser):
             reasoning = _STRUCTURAL_TOKENS.sub("", reasoning).strip()
             reasoning = reasoning if reasoning else None
 
+        # Commentary channels carry harmony tool calls
+        # (<|channel|>commentary to=functions.NAME ... <|message|>{args}<|call|>).
+        # They are neither reasoning nor final text — return them RAW inside
+        # content so the downstream harmony tool parser can extract the calls
+        # (it needs the channel header and <|message|>/<|call|> structure, so
+        # this must bypass the structural-token stripping above). Without
+        # this, a generation that is analysis + tool call yields content=None
+        # and the tool call is silently dropped.
+        if content is None and "<|channel|>commentary" in model_output:
+            idx = model_output.find("<|channel|>commentary")
+            return reasoning, model_output[idx:]
+
         # If no channels found, return as plain content
         if reasoning is None and content is None:
             return None, model_output
@@ -126,6 +138,18 @@ class GptOssReasoningParser(ReasoningParser):
         """
         prev_phase = self._detect_phase(previous_text)
         curr_phase = self._detect_phase(current_text)
+
+        # Entered a commentary (tool-call) channel: emit RAW from the channel
+        # marker onward — the streaming harmony tool parser downstream needs
+        # the full header (to=functions.NAME) and the <|message|>/<|call|>
+        # structure to extract the call. Nothing after the marker has been
+        # emitted yet (analysis went to reasoning, markers were suppressed).
+        if curr_phase == "commentary":
+            if prev_phase != "commentary":
+                idx = current_text.rfind("<|channel|>commentary")
+                tail = current_text[idx:] if idx >= 0 else delta_text
+                return DeltaMessage(content=tail) if tail else None
+            return DeltaMessage(content=delta_text) if delta_text else None
 
         # Phase changed — extract content after the new marker
         if curr_phase != prev_phase and curr_phase in ("analysis", "final"):
@@ -167,6 +191,7 @@ class GptOssReasoningParser(ReasoningParser):
 
         Returns:
             "final"      — final channel marker complete
+            "commentary" — commentary (tool-call) channel marker complete
             "analysis"   — analysis marker complete, no structural token after
             "transition" — analysis present but structural token follows
             "init"       — no channel marker yet
@@ -179,6 +204,8 @@ class GptOssReasoningParser(ReasoningParser):
         last = matches[-1]
         if last.group(1) == "final":
             return "final"
+        if last.group(1) == "commentary":
+            return "commentary"
 
         # analysis channel found — check if there's a structural token after
         after = text[last.end() :]

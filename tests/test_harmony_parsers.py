@@ -632,12 +632,19 @@ class TestHarmonyToolDefinitionConverter:
 class TestHarmonyEdgeCases:
     """Edge case tests for Harmony parsers."""
 
-    def test_tool_parser_incomplete_call(self):
-        """Incomplete tool call (missing <|call|>) is not parsed."""
+    def test_tool_parser_eos_terminated_call(self):
+        """A commentary block ending at end-of-text IS a complete call.
+
+        <|call|> is in the model's EOS set, so generation stops on it and
+        the emitted text ends right after the JSON arguments. Requiring the
+        terminator dropped every tool call that ended a generation.
+        """
         parser = HarmonyToolParser()
         text = "<|channel|>commentary to=functions.func\n" '<|message|>{"arg": "value"}'
         result = parser.extract_tool_calls(text)
-        assert not result.tools_called
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "func"
+        assert result.tool_calls[0]["arguments"] == '{"arg": "value"}'
 
     def test_tool_parser_unicode_content(self):
         """Handle unicode in tool arguments."""

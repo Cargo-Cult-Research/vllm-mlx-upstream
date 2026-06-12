@@ -878,10 +878,17 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        clean_output: bool = True,
         **kwargs,
     ) -> GenerationOutput:
         """
         Chat completion (non-streaming).
+
+        Accepts ``clean_output`` for engine-interface parity with
+        SimpleEngine.chat; this engine cleans only the accumulated ``text``
+        field (``new_text`` stays raw for streaming parsers), and the model
+        families it serves don't use markers that cleaning destroys, so the
+        flag is currently ignored.
 
         For MLLM models, all requests (including text-only) are routed through
         the MLLMScheduler for vision-aware batched generation.
