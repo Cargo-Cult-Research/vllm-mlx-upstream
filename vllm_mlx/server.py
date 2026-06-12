@@ -957,6 +957,10 @@ _STREAMING_TOOL_MARKERS = (
     "[TOOL_CALLS]",
     "<minimax:tool_call>",
     '<invoke name="',
+    # GPT-OSS harmony tool calls (commentary channel). Without this the
+    # raw channel block streams to the client as text before the
+    # end-of-stream parse extracts the call.
+    "<|channel|>commentary",
 )
 _STREAMING_BARE_BRACKET_MARKER = re.compile(r"\[\w+\(\{")
 _STREAMING_BARE_BRACKET_PARTIAL = re.compile(r"\[\w+\($")
@@ -2354,7 +2358,7 @@ async def _run_responses_request(
 
     timeout = _default_timeout
     output = await _wait_with_disconnect(
-        engine.chat(messages=messages, **chat_kwargs),
+        engine.chat(messages=messages, clean_output=False, **chat_kwargs),
         raw_request,
         timeout=timeout,
     )
@@ -4869,7 +4873,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
         try:
             output = await _wait_with_disconnect(
-                engine.chat(messages=prepared.messages, **prepared.chat_kwargs),
+                engine.chat(
+                    messages=prepared.messages,
+                    # Raw text: reasoning/tool parsers below need the harmony
+                    # channel markers; cleaning happens post-parse.
+                    clean_output=False,
+                    **prepared.chat_kwargs,
+                ),
                 raw_request,
                 timeout=_remaining_request_timeout(total_timeout, deadline),
                 timeout_detail_seconds=total_timeout,
@@ -5293,7 +5303,13 @@ async def create_anthropic_message(
         start_time = time.perf_counter()
         try:
             output = await _wait_with_disconnect(
-                engine.chat(messages=prepared.messages, **prepared.chat_kwargs),
+                engine.chat(
+                    messages=prepared.messages,
+                    # Raw text: reasoning/tool parsers below need the harmony
+                    # channel markers; cleaning happens post-parse.
+                    clean_output=False,
+                    **prepared.chat_kwargs,
+                ),
                 request,
                 timeout=_remaining_request_timeout(total_timeout, deadline),
                 timeout_detail_seconds=total_timeout,
@@ -5647,9 +5663,15 @@ async def _stream_anthropic_messages(
             if not delta_text:
                 continue
 
-            # Filter special tokens
+            # Filter special tokens — but only for the no-parser path.
+            # Marker-structured models (GPT-OSS harmony) carry channel
+            # routing in special tokens; stripping them before the reasoning
+            # parser leaves it stuck in init phase and the stream emits
+            # nothing. The parser path consumes RAW deltas (a delta that is
+            # purely a marker must still reach the parser, so don't skip on
+            # empty `filtered` there); parser output is what gets emitted.
             filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
-            if not filtered:
+            if not use_reasoning and not filtered:
                 continue
 
             if not use_reasoning:
@@ -5688,11 +5710,13 @@ async def _stream_anthropic_messages(
                 yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content_to_emit}})}\n\n"
                 continue
 
-            # Reasoning parser path
+            # Reasoning parser path — raw deltas (see comment above);
+            # accumulated_text stays raw too so the end-of-stream
+            # _parse_tool_calls_with_parser sees the full harmony structure.
             previous_text = accumulated_text
-            accumulated_text += filtered
+            accumulated_text += delta_text
             delta_msg = _reasoning_parser.extract_reasoning_streaming(
-                previous_text, accumulated_text, filtered
+                previous_text, accumulated_text, delta_text
             )
 
             if delta_msg is None:

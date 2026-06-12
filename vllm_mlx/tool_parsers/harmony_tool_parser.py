@@ -35,10 +35,14 @@ def _generate_tool_id() -> str:
 
 
 # Pattern: <|channel|>commentary to=functions.tool_name ... <|call|>
+# The <|call|> terminator is optional-at-end-of-text: it is in the model's
+# EOS set, so generation STOPS on it and the emitted text ends right after
+# the JSON arguments. Requiring the terminator silently dropped every
+# tool call that ended a generation (i.e. nearly all of them).
 _COMMENTARY_BLOCK_PATTERN = re.compile(
     r"<\|channel\|>commentary\s+to=functions\.(\w+)"
     r"(?:\s*<\|constrain\|>\w+)?"
-    r"\s*<\|message\|>(.*?)<\|call\|>",
+    r"\s*<\|message\|>(.*?)(?:<\|call\|>|$)",
     re.DOTALL,
 )
 
