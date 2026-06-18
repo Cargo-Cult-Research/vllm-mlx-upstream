@@ -679,6 +679,18 @@ def _prepare_chat_completion_invocation(
         chat_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+    # Activation steering (per-request): resolve a registered vector + scale into a
+    # spec for the engine. Disabled when tools are active (steering breaks tool-calls).
+    if request.steering_vector and request.steering_scale:
+        from vllm_mlx import steering
+        _tools_active = bool(request.tools) and request.tool_choice != "none"
+        _entry = steering.get(request.steering_vector)
+        if _entry and not _tools_active:
+            chat_kwargs["steering"] = {
+                "vectors": _entry["vectors"],
+                "scale": float(request.steering_scale),
+                "rms": _entry["rms"],
+            }
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
         request.chat_template_kwargs
     )

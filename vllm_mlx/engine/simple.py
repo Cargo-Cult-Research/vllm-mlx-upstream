@@ -265,12 +265,16 @@ class SimpleEngine(BaseEngine):
 
         self._model.load()
 
-        # Install the generic activation-steering hook (inert until a request
-        # passes a steering spec). Guarded so it can never break model serving.
+        # Install the generic activation-steering hook (inert until a request passes
+        # a steering spec) and load named steering vectors from STEERING_VECTORS_DIR.
+        # Guarded so it can never break model serving.
         try:
             steering.install(self._model.model)
+            names = steering.load_registry(os.environ.get("STEERING_VECTORS_DIR", ""))
+            if names:
+                logger.info("steering: loaded vectors %s", names)
         except Exception as e:  # pragma: no cover - safety net
-            logger.warning("steering.install skipped: %s", e)
+            logger.warning("steering setup skipped: %s", e)
 
     def _uses_default_prepare_for_start(self) -> bool:
         """Return True when prepare_for_start is the class implementation."""

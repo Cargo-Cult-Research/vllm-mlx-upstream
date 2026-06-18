@@ -186,6 +186,11 @@ class ChatCompletionRequest(BaseModel):
     specprefill: bool | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
+    # Activation steering: apply a named steering vector (loaded in the registry) to
+    # the residual stream at `steering_scale` (% of per-layer norm). None/0 = off.
+    # Auto-disabled when tools are present (steering breaks tool-call formatting).
+    steering_vector: str | None = None
+    steering_scale: float | None = None
     # Enable/disable thinking mode (None = server default, typically True)
     enable_thinking: bool | None = None
     # MLLM assistant-drafter path: opt in to using a configured drafter.
