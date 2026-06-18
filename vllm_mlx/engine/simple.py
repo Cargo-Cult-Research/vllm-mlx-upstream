@@ -7,6 +7,7 @@ performance when serving a single user at a time.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import os
@@ -28,8 +29,17 @@ from .base import (
 )
 from .chat_template_safety import normalize_messages_for_chat_template
 from ..mlx_streams import bind_generation_streams
+from .. import steering
 
 logger = logging.getLogger(__name__)
+
+
+def _steering_ctx(spec):
+    """Context manager that activates a per-request steer for the duration of one
+    (serialized) generation, or a no-op when no spec / zero scale is given."""
+    if spec and spec.get("scale"):
+        return steering.active(spec["vectors"], spec["scale"], spec.get("rms"))
+    return contextlib.nullcontext()
 
 
 def _bind_worker_generation_streams() -> None:
@@ -254,6 +264,13 @@ class SimpleEngine(BaseEngine):
             )
 
         self._model.load()
+
+        # Install the generic activation-steering hook (inert until a request
+        # passes a steering spec). Guarded so it can never break model serving.
+        try:
+            steering.install(self._model.model)
+        except Exception as e:  # pragma: no cover - safety net
+            logger.warning("steering.install skipped: %s", e)
 
     def _uses_default_prepare_for_start(self) -> bool:
         """Return True when prepare_for_start is the class implementation."""
@@ -773,6 +790,35 @@ class SimpleEngine(BaseEngine):
         clean_output: bool = True,
         **kwargs,
     ) -> GenerationOutput:
+        """Non-streaming chat with per-request activation steering. Wraps the impl so
+        the steer covers EVERY branch — including the non-mllm/no-tools path that calls
+        self._model.chat directly (which does NOT route through stream_chat)."""
+        spec = kwargs.pop("steering", None)
+        with _steering_ctx(spec):
+            return await self._chat_impl(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                images=images,
+                videos=videos,
+                clean_output=clean_output,
+                **kwargs,
+            )
+
+    async def _chat_impl(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        clean_output: bool = True,
+        **kwargs,
+    ) -> GenerationOutput:
         """
         Chat completion (non-streaming).
 
@@ -898,6 +944,34 @@ class SimpleEngine(BaseEngine):
             )
 
     async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """Streaming chat with per-request activation steering, active for the whole
+        stream. Direct streaming callers enter here; engine.chat's aggregate path also
+        lands here with the steer already active under its own context (nested, fine)."""
+        spec = kwargs.pop("steering", None)
+        with _steering_ctx(spec):
+            async for _out in self._stream_chat_impl(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                images=images,
+                videos=videos,
+                **kwargs,
+            ):
+                yield _out
+
+    async def _stream_chat_impl(
         self,
         messages: list[dict[str, Any]],
         max_tokens: int = 256,
