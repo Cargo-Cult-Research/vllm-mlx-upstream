@@ -71,6 +71,11 @@ class AnthropicRequest(BaseModel):
     response_format: dict | None = None
     # OpenAI-compatible extension for tokenizer chat template kwargs.
     chat_template_kwargs: dict[str, Any] | None = None
+    # Anthropic extended-thinking control, e.g. {"type": "adaptive"} or
+    # {"type": "enabled", "budget_tokens": N} / {"type": "disabled"}.
+    # Claude Code sends {"type": "adaptive"}. Carries no effort scale; the
+    # adapter maps an enabled value to the OpenAI ``enable_thinking`` flag.
+    thinking: dict[str, Any] | None = None
 
 
 # =============================================================================

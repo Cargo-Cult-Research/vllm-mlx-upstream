@@ -304,6 +304,27 @@ class TestAnthropicToOpenai:
         result = anthropic_to_openai(req)
         assert result.top_p == 0.9
 
+    def test_thinking_absent_leaves_enable_thinking_unset(self):
+        req = self._make_request()
+        result = anthropic_to_openai(req)
+        assert result.enable_thinking is None
+
+    def test_thinking_adaptive_enables_thinking(self):
+        # Claude Code sends {"type": "adaptive"}.
+        req = self._make_request(thinking={"type": "adaptive"})
+        result = anthropic_to_openai(req)
+        assert result.enable_thinking is True
+
+    def test_thinking_enabled_enables_thinking(self):
+        req = self._make_request(thinking={"type": "enabled", "budget_tokens": 4000})
+        result = anthropic_to_openai(req)
+        assert result.enable_thinking is True
+
+    def test_thinking_disabled_disables_thinking(self):
+        req = self._make_request(thinking={"type": "disabled"})
+        result = anthropic_to_openai(req)
+        assert result.enable_thinking is False
+
     def test_top_p_explicit(self):
         req = self._make_request(top_p=0.5)
         result = anthropic_to_openai(req)

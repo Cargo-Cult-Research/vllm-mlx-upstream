@@ -82,6 +82,19 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
     if request.tool_choice:
         tool_choice = _convert_tool_choice(request.tool_choice)
 
+    # Translate Anthropic extended-thinking control to the OpenAI-side
+    # ``enable_thinking`` flag. Anthropic's ``thinking`` carries no low/med/high
+    # effort scale (Claude Code sends {"type": "adaptive"}), so we only resolve
+    # the on/off signal here; the reasoning-effort mapping happens server-side
+    # in _prepare_anthropic_invocation. Unknown/absent → leave as default.
+    enable_thinking = None
+    if isinstance(request.thinking, dict):
+        thinking_type = request.thinking.get("type")
+        if thinking_type in ("enabled", "adaptive"):
+            enable_thinking = True
+        elif thinking_type == "disabled":
+            enable_thinking = False
+
     return ChatCompletionRequest(
         model=request.model,
         messages=messages,
@@ -96,6 +109,7 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
         # dicts into the strict ResponseFormat model via pydantic.
         response_format=request.response_format,
         chat_template_kwargs=request.chat_template_kwargs,
+        enable_thinking=enable_thinking,
     )
 
 

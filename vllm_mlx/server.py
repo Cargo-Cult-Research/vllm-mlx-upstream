@@ -802,6 +802,23 @@ def _prepare_anthropic_invocation(
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
         openai_request.chat_template_kwargs
     )
+    # gpt-oss reasoning effort: the Anthropic `thinking` field carries no
+    # low/medium/high effort scale, so when a client requests thinking
+    # (Claude Code sends thinking={"type": "adaptive"}) we pin reasoning
+    # effort to a deliberate default. Empirically "high" over-ruminates on
+    # agentic Claude Code loops (huge first-turn thinking before any tool
+    # call), so "medium" is the chosen default; raise per-request via
+    # chat_template_kwargs or server-wide via --default-chat-template-kwargs,
+    # both of which take precedence over this inferred value.
+    if (
+        _reasoning_parser is not None
+        and openai_request.enable_thinking
+        and "reasoning_effort" not in resolved_chat_template_kwargs
+    ):
+        resolved_chat_template_kwargs = {
+            **resolved_chat_template_kwargs,
+            "reasoning_effort": "medium",
+        }
     if resolved_chat_template_kwargs:
         chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
 
@@ -3315,6 +3332,26 @@ async def status():
         "mtp": stats.get("mtp") or {"enabled": False},
         "requests": stats.get("requests", []),
     }
+
+
+class ReadoutRequest(BaseModel):
+    text: str
+
+
+@app.post("/v1/readout", dependencies=[Depends(verify_api_key)])
+async def readout(request: ReadoutRequest):
+    """Perceived-valence readout: forward `text` through the model (no generation),
+    capturing residuals at the calibrated read band, and project onto the loaded read
+    calibration. Returns {"valence": float|null}. valence is null when the readout is
+    uncalibrated (server started without READOUT_CALIB) — callers treat that as "no
+    reading". Distinct from steering (which WRITES a direction); this only READS."""
+    if _engine is None:
+        raise HTTPException(status_code=503, detail="Engine not loaded")
+    fn = getattr(_engine, "readout", None)
+    if fn is None:
+        return {"valence": None}
+    value = await fn(request.text)
+    return {"valence": value}
 
 
 @app.get("/v1/cache/stats", dependencies=[Depends(verify_api_key)])
