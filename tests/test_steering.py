@@ -93,3 +93,44 @@ def test_registry_roundtrip(tmp_path):
 
 def test_load_registry_missing_dir_is_safe(tmp_path):
     assert steering.load_registry(tmp_path / "nope") == []
+
+
+# --- readout ---------------------------------------------------------------------
+
+def test_hook_captures_mean_token_residual_when_active(model):
+    x = mx.array([[[2.0, 4.0], [4.0, 8.0], [6.0, 0.0]]])   # (1, 3 tokens, hidden=2)
+    steering._CAPTURE = {2: None}
+    try:
+        model.model.layers[2](x, None)
+        assert steering._CAPTURE[2] is not None
+        assert mx.allclose(steering._CAPTURE[2], mx.array([4.0, 4.0]))  # mean over tokens
+        # a non-captured layer is untouched
+        steering._CAPTURE = {2: None}
+        model.model.layers[0](x, None)
+        assert steering._CAPTURE[2] is None
+    finally:
+        steering._CAPTURE = None
+
+
+def test_read_valence_math():
+    steering._READ = {
+        "band": [5],
+        "base": {5: mx.zeros(3)},
+        "pos": {5: mx.array([1.0, 0.0, 0.0])},
+        "neg": {5: mx.array([0.0, 1.0, 0.0])},
+        "psd": {5: 2.0},
+        "nsd": {5: 4.0},
+    }
+    try:
+        cap = {5: mx.array([6.0, 8.0, 0.0])}
+        # pz = (6)/2 = 3 ; nz = (8)/4 = 2 ; valence = 1
+        assert steering.read_valence(cap) == pytest.approx(1.0)
+        assert steering.read_valence(None) is None
+    finally:
+        steering._READ = None
+
+
+def test_read_band_and_valence_disabled_without_calib():
+    steering._READ = None
+    assert steering.read_band() == []
+    assert steering.read_valence({5: mx.zeros(3)}) is None

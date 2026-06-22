@@ -273,6 +273,9 @@ class SimpleEngine(BaseEngine):
             names = steering.load_registry(os.environ.get("STEERING_VECTORS_DIR", ""))
             if names:
                 logger.info("steering: loaded vectors %s", names)
+            band = steering.load_read_calib(os.environ.get("READOUT_CALIB", ""))
+            if band:
+                logger.info("steering: readout calibrated on band %s", band)
         except Exception as e:  # pragma: no cover - safety net
             logger.warning("steering setup skipped: %s", e)
 
@@ -781,6 +784,26 @@ class SimpleEngine(BaseEngine):
                     finished=True,
                     finish_reason=None,
                 )
+
+    async def readout(self, text: str) -> float | None:
+        """Perceived-valence readout: forward `text` (no generation), capturing mean-
+        token residuals at the calibrated read band, and project onto the loaded read
+        calibration. Returns a scalar valence, or None if the readout is uncalibrated
+        (no READOUT_CALIB) or the model isn't loaded. Runs on the bound MLX worker
+        thread under the generation lock, like any other forward."""
+        if not self._loaded or self._model is None:
+            return None
+        if not steering.read_band():
+            return None
+        ids = self._model.tokenizer.encode(text)
+        if not ids:
+            return None
+
+        def _do():
+            captured = steering.run_capture(self._model.model, ids)
+            return steering.read_valence(captured)
+
+        return await self._run_blocking_serialized(_do)
 
     async def chat(
         self,

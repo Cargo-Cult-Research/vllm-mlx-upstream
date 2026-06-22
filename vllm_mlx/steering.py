@@ -36,6 +36,11 @@ import mlx.core as mx
 _ACTIVE: dict | None = None
 _INSTALLED: dict = {"done": False}
 _REGISTRY: dict[str, dict] = {}
+# Readout: capture residuals at the read band during a forward, then project onto a
+# loaded read calibration to get a perceived-valence scalar. _CAPTURE is {layer: mean-
+# token residual} while a capture is in flight, else None. _READ holds the calibration.
+_CAPTURE: dict | None = None
+_READ: dict | None = None
 
 
 def set_active(vectors: dict, scale: float, rms: dict | None = None) -> None:
@@ -75,13 +80,15 @@ def install(raw_model) -> bool:
 
     def patched(self, x, mask, cache=None):
         out = orig(self, x, mask, cache)
+        idx = getattr(self, "_steer_idx", -1)
         st = _ACTIVE
         if st is not None and st["scale"]:
-            idx = getattr(self, "_steer_idx", -1)
             vec = st["vectors"].get(idx)
             if vec is not None:
                 mag = st["scale"] / 100.0 * st["rms"].get(idx, 1.0)
                 out = out + mag * vec
+        if _CAPTURE is not None and idx in _CAPTURE:
+            _CAPTURE[idx] = mx.mean(out[0].astype(mx.float32), axis=0)  # (hidden,)
         return out
 
     Block.__call__ = patched
@@ -115,3 +122,59 @@ def load_registry(path: str | Path) -> list[str]:
 
 def get(name: str) -> dict | None:
     return _REGISTRY.get(name)
+
+
+# --- Readout (perceived valence from activations) -------------------------------
+
+def load_read_calib(path: str | Path) -> list[int]:
+    """Load a neutral-anchored two-pole read calibration: per band layer, base
+    (neutral mean), pos/neg unit dirs, and psd/nsd projection scales. Returns the
+    band. Safe with a missing file (readout stays disabled)."""
+    global _READ
+    p = Path(path)
+    if not p.is_file():
+        return []
+    d = mx.load(str(p))
+    band = sorted(int(k[5:]) for k in d if k.startswith("base_"))
+    R: dict = {"band": band, "base": {}, "pos": {}, "neg": {}, "psd": {}, "nsd": {}}
+    for L in band:
+        R["base"][L] = d[f"base_{L}"]; R["pos"][L] = d[f"pos_{L}"]; R["neg"][L] = d[f"neg_{L}"]
+        R["psd"][L] = float(d[f"psd_{L}"][0]); R["nsd"][L] = float(d[f"nsd_{L}"][0])
+    _READ = R
+    return band
+
+
+def read_band() -> list[int]:
+    return list(_READ["band"]) if _READ else []
+
+
+def run_capture(raw_model, ids: list[int]) -> dict | None:
+    """Forward `ids` through the model capturing mean-token residuals at the read
+    band. MUST run on the MLX worker thread (streams bound). Returns {layer: vec}."""
+    global _CAPTURE
+    if _READ is None:
+        return None
+    _CAPTURE = {L: None for L in _READ["band"]}
+    try:
+        raw_model.model(mx.array([ids]))
+        mx.eval([v for v in _CAPTURE.values() if v is not None])
+        return dict(_CAPTURE)
+    finally:
+        _CAPTURE = None
+
+
+def read_valence(captured: dict | None) -> float | None:
+    """Perceived valence = mean over the band of (positivity_z - negativity_z),
+    neutral-anchored. Same math as the offline read meter. None if uncalibrated."""
+    if _READ is None or not captured:
+        return None
+    R = _READ
+    vals = []
+    for L in R["band"]:
+        f = captured.get(L)
+        if f is None:
+            continue
+        pz = float((f - R["base"][L]) @ R["pos"][L]) / R["psd"][L]
+        nz = float((f - R["base"][L]) @ R["neg"][L]) / R["nsd"][L]
+        vals.append(pz - nz)
+    return sum(vals) / len(vals) if vals else None
