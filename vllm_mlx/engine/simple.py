@@ -645,6 +645,23 @@ class SimpleEngine(BaseEngine):
                 _bind_worker_generation_streams()
                 return func(*args, **kwargs)
 
+            if self._uses_default_prepare_for_start():
+                # The default engine loads the model on the event-loop thread
+                # (see start()), and MLX streams are thread-local. The streaming
+                # path already runs decode inline on that thread
+                # (_stream_generate_impl); routing this blocking path through a
+                # worker thread instead crashes pure-LLM decode on the first
+                # request after load ("no Stream(gpu, N) in current thread") and
+                # leaves the serialized slot wedged. Metal access is serialized
+                # under the generation slot, so running inline is correct here,
+                # not merely expedient.
+                try:
+                    return run_bound()
+                finally:
+                    self._active_requests.pop(request_id, None)
+
+            # Custom/test-double engines may load the model off the event-loop
+            # thread and may block; keep the cancellation-safe worker path.
             task = asyncio.create_task(asyncio.to_thread(run_bound))
             try:
                 return await asyncio.shield(task)
