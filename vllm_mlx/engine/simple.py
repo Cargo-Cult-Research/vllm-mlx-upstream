@@ -548,6 +548,46 @@ class SimpleEngine(BaseEngine):
                     pass
                 raise
 
+    async def _stream_chunks_on_worker(self, make_gen):
+        """Bridge a synchronous mlx generator to async, running it on the pinned
+        MLX worker thread.
+
+        The model is loaded on the worker thread and MLX streams are per-thread,
+        so the generator MUST run there — running it on the asyncio thread raises
+        "no Stream(gpu, N) in current thread". Chunks are handed back over a
+        thread-safe queue so streaming stays incremental; the generation lock is
+        held for the whole stream to serialize Metal access.
+        """
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        DONE = object()
+
+        def producer():
+            _bind_worker_generation_streams()
+            try:
+                for chunk in make_gen():
+                    loop.call_soon_threadsafe(queue.put_nowait, chunk)
+            except BaseException as exc:  # surface to the consumer
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            else:
+                loop.call_soon_threadsafe(queue.put_nowait, DONE)
+
+        async with self._generation_lock:
+            fut = asyncio.wrap_future(self._mlx_executor.submit(producer))
+            try:
+                while True:
+                    item = await queue.get()
+                    if item is DONE:
+                        break
+                    if isinstance(item, BaseException):
+                        raise item
+                    yield item
+            finally:
+                try:
+                    await fut
+                except BaseException:
+                    pass
+
     async def generate(
         self,
         prompt: str,
@@ -1078,40 +1118,43 @@ class SimpleEngine(BaseEngine):
             accumulated_text = ""
             token_count = 0
 
-            # Text-only fallback when no TextModel exists: keep execution on the
-            # current thread. Routing through to_thread can break mlx_vlm stream
-            # ownership on some models (Stream(gpu, N) mismatch).
             if self._text_model is None and not has_media_content(messages):
+                # Text-only request on an MLLM with no separate TextModel. The
+                # model was loaded on the pinned MLX worker thread, so generation
+                # MUST run there too — running stream_chat on the asyncio thread
+                # raises "no Stream(gpu, N) in current thread". Bridge the sync
+                # generator back over a queue to keep streaming incremental.
                 local_kwargs = mllm_call_kwargs()
 
-                async with self._generation_lock:
-                    _bind_worker_generation_streams()
-                    for chunk in self._model.stream_chat(
+                def _make_stream():
+                    return self._model.stream_chat(
                         messages=messages,
                         max_tokens=max_tokens,
                         temperature=temperature,
                         tools=template_tools,
                         **local_kwargs,
-                    ):
-                        token_count += 1
-                        new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                        accumulated_text += new_text
+                    )
 
-                        finished = chunk.finish_reason is not None
+                async for chunk in self._stream_chunks_on_worker(_make_stream):
+                    token_count += 1
+                    new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                    accumulated_text += new_text
 
-                        yield GenerationOutput(
-                            text=accumulated_text,
-                            new_text=new_text,
-                            prompt_tokens=getattr(chunk, "prompt_tokens", 0),
-                            completion_tokens=token_count,
-                            finished=finished,
-                            finish_reason=chunk.finish_reason if finished else None,
-                            mtp_drafts=getattr(chunk, "mtp_drafts", 0),
-                            mtp_accepted=getattr(chunk, "mtp_accepted", 0),
-                        )
+                    finished = chunk.finish_reason is not None
 
-                        if finished:
-                            break
+                    yield GenerationOutput(
+                        text=accumulated_text,
+                        new_text=new_text,
+                        prompt_tokens=getattr(chunk, "prompt_tokens", 0),
+                        completion_tokens=token_count,
+                        finished=finished,
+                        finish_reason=chunk.finish_reason if finished else None,
+                        mtp_drafts=getattr(chunk, "mtp_drafts", 0),
+                        mtp_accepted=getattr(chunk, "mtp_accepted", 0),
+                    )
+
+                    if finished:
+                        break
                 return
 
             # Run stream_chat in thread pool since it's synchronous

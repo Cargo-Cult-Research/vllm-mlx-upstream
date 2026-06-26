@@ -2,11 +2,12 @@
 """
 Mistral tool call parser for vllm-mlx.
 
-Handles Mistral's tool calling format:
-- Format: [TOOL_CALLS] [{"name": "func", "arguments": {...}}]
-- Or newer: [TOOL_CALLS]func_name{"arg": "value"}
+Handles Mistral's tool calling formats:
+- Old (< v11):  [TOOL_CALLS] [{"name": "func", "arguments": {...}}]
+- New (>= v11): [TOOL_CALLS]func_name{"arg": "value"}
+- Tekken (Mistral Small 4): [TOOL_CALLS]func_name[ARGS]{"arg": "value"}
 
-Used with models like Mistral-7B-Instruct, Devstral, etc.
+Used with models like Mistral-7B-Instruct, Devstral, Mistral Small 4, etc.
 """
 
 import json
@@ -39,9 +40,10 @@ class MistralToolParser(ToolParser):
     """
     Tool call parser for Mistral models.
 
-    Supports both old and new Mistral tool call formats:
+    Supports old, new, and tekken Mistral tool call formats:
     - Old (< v11): [TOOL_CALLS] [{"name": "add", "arguments": {"a": 1, "b": 2}}]
     - New (>= v11): [TOOL_CALLS]add{"a": 1, "b": 2}
+    - Tekken (Small 4): [TOOL_CALLS]add[ARGS]{"a": 1, "b": 2}
 
     Used when --enable-auto-tool-choice --tool-call-parser mistral are set.
     """
@@ -84,6 +86,23 @@ class MistralToolParser(ToolParser):
         for raw_tool_call in raw_tool_calls:
             raw_tool_call = raw_tool_call.strip()
             if not raw_tool_call:
+                continue
+
+            # Tekken format (Mistral Small 4 / v11+): func_name[ARGS]{"arg": "value"}
+            # The name and JSON args are separated by a literal [ARGS] control
+            # token; splitting on "{" (below) would fold [ARGS] into the name.
+            if "[ARGS]" in raw_tool_call:
+                name_part, args_part = raw_tool_call.split("[ARGS]", 1)
+                tool_name = name_part.strip()
+                args_str = args_part.strip()
+                if tool_name:
+                    tool_calls.append(
+                        {
+                            "id": generate_mistral_tool_id(),
+                            "name": tool_name,
+                            "arguments": args_str,
+                        }
+                    )
                 continue
 
             # Try new format first: func_name{"arg": "value"}
@@ -238,6 +257,15 @@ class MistralToolParser(ToolParser):
             return None
 
         result: dict[str, str] = {}
+
+        # Tekken format separator: name[ARGS]{json}
+        if "[ARGS]" in text:
+            name_part, args_part = text.split("[ARGS]", 1)
+            if name_part.strip():
+                result["name"] = name_part.strip()
+            if args_part:
+                result["arguments"] = args_part
+            return result if result else None
 
         # Check for function name (before {)
         if "{" in text:
