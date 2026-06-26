@@ -106,6 +106,65 @@ MIN_FRAMES = 4
 MAX_FRAMES = 128  # Practical limit for most MLLMs
 IMAGE_FACTOR = 28  # For smart resize
 
+
+def _content_text(content: object) -> str:
+    """Best-effort flatten of a chat message's content to plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+        return "".join(parts)
+    return ""
+
+
+def _last_user_text(chat_messages: list[dict]) -> str:
+    """The text of the most recent user message (last-ditch template fallback)."""
+    for m in reversed(chat_messages):
+        if m.get("role") == "user":
+            return _content_text(m.get("content", ""))
+    return ""
+
+
+def _fold_system_into_first_user(chat_messages: list[dict]) -> list[dict] | None:
+    """Return a copy of ``chat_messages`` with system turns folded into the
+    first user turn, or ``None`` if there is no system role to fold.
+
+    Several multimodal chat templates (Mistral 3 / Pixtral, Gemma 4) only
+    accept user/assistant/tool roles and raise on a ``system`` role. The old
+    behaviour fell back to a bare last-user-message, which silently dropped the
+    system prompt *and* all tool definitions — so tool calls leaked as plain
+    text. Mistral's own convention is to prepend the system prompt to the first
+    user message, so do that explicitly and let the template see only roles it
+    supports. Used only on the failure path, so templates that accept ``system``
+    are untouched.
+    """
+    if not any(m.get("role") == "system" for m in chat_messages):
+        return None
+    system_text = "\n\n".join(
+        t for t in (_content_text(m.get("content", "")) for m in chat_messages
+                    if m.get("role") == "system") if t
+    ).strip()
+    rest = [dict(m) for m in chat_messages if m.get("role") != "system"]
+    if not system_text:
+        return rest
+    for m in rest:
+        if m.get("role") == "user":
+            content = m.get("content", "")
+            if isinstance(content, list):
+                m["content"] = [{"type": "text", "text": system_text,
+                                 "content": system_text}] + content
+            else:
+                m["content"] = f"{system_text}\n\n{content}"
+            return rest
+    # No user turn to attach to — promote the system text to one.
+    return [{"role": "user", "content": [{"type": "text", "text": system_text,
+                                          "content": system_text}]}] + rest
+
 # Security: File size limits (in bytes)
 MAX_IMAGE_SIZE = 20 * 1024 * 1024  # 20 MB max for images
 MAX_VIDEO_SIZE = 500 * 1024 * 1024  # 500 MB max for videos
@@ -1990,23 +2049,32 @@ class MLXMultimodalLM:
                 **template_extra_kwargs,
             )
         except Exception as e:
-            logger.warning(
-                f"Failed to apply chat template: {e}, using last user message"
-            )
-            # Fallback to last user message if template fails
-            last_user_msg = ""
-            for m in reversed(chat_messages):
-                if m["role"] == "user":
-                    content = m.get("content", "")
-                    if isinstance(content, list):
-                        for item in content:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                last_user_msg = item.get("text", "")
-                                break
-                    else:
-                        last_user_msg = content
-                    break
-            formatted_prompt = last_user_msg
+            # A `system` role is the usual culprit: templates that reject it
+            # (Mistral 3 / Pixtral, Gemma 4) raise here, and dropping to a bare
+            # last-user-message loses the tool definitions → tool calls leak as
+            # plain text. Retry once with system folded into the first user turn
+            # (Mistral's convention) so the tools survive.
+            folded = _fold_system_into_first_user(chat_messages)
+            if folded is not None:
+                try:
+                    formatted_prompt = get_chat_template(
+                        self.processor,
+                        folded,
+                        add_generation_prompt=True,
+                        enable_thinking=enable_thinking,
+                        **template_extra_kwargs,
+                    )
+                except Exception:
+                    logger.warning(
+                        f"Failed to apply chat template even after folding "
+                        f"system into user: {e}, using last user message"
+                    )
+                    formatted_prompt = _last_user_text(chat_messages)
+            else:
+                logger.warning(
+                    f"Failed to apply chat template: {e}, using last user message"
+                )
+                formatted_prompt = _last_user_text(chat_messages)
 
         # Prefix caching with vision embedding support
         # Following LMCache approach: cache vision embeddings to skip encoder on hit
@@ -2356,23 +2424,32 @@ class MLXMultimodalLM:
                 **template_extra_kwargs,
             )
         except Exception as e:
-            logger.warning(
-                f"Failed to apply chat template: {e}, using last user message"
-            )
-            # Fallback to last user message if template fails
-            last_user_msg = ""
-            for m in reversed(chat_messages):
-                if m["role"] == "user":
-                    content = m.get("content", "")
-                    if isinstance(content, list):
-                        for item in content:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                last_user_msg = item.get("text", "")
-                                break
-                    else:
-                        last_user_msg = content
-                    break
-            formatted_prompt = last_user_msg
+            # A `system` role is the usual culprit: templates that reject it
+            # (Mistral 3 / Pixtral, Gemma 4) raise here, and dropping to a bare
+            # last-user-message loses the tool definitions → tool calls leak as
+            # plain text. Retry once with system folded into the first user turn
+            # (Mistral's convention) so the tools survive.
+            folded = _fold_system_into_first_user(chat_messages)
+            if folded is not None:
+                try:
+                    formatted_prompt = get_chat_template(
+                        self.processor,
+                        folded,
+                        add_generation_prompt=True,
+                        enable_thinking=enable_thinking,
+                        **template_extra_kwargs,
+                    )
+                except Exception:
+                    logger.warning(
+                        f"Failed to apply chat template even after folding "
+                        f"system into user: {e}, using last user message"
+                    )
+                    formatted_prompt = _last_user_text(chat_messages)
+            else:
+                logger.warning(
+                    f"Failed to apply chat template: {e}, using last user message"
+                )
+                formatted_prompt = _last_user_text(chat_messages)
 
         # Check cache for existing KV state (uses images as cache key)
         from mlx_vlm.models import cache as vlm_cache

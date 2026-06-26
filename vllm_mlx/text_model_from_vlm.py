@@ -28,11 +28,20 @@ def _import_text_model_classes(model_type: str):
 
         return Model, ModelArgs
 
-    # qwen3_5.TextModel and TextModelArgs handle both dense and MoE natively
-    # (MTPDecoderLayer auto-selects SparseMoeBlock when args.num_experts > 0).
-    from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+    if model_type in ("qwen3_5_text", "qwen3_5"):
+        # qwen3_5.TextModel and TextModelArgs handle both dense and MoE natively
+        # (MTPDecoderLayer auto-selects SparseMoeBlock when args.num_experts > 0).
+        from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
 
-    return TextModel, TextModelArgs
+        return TextModel, TextModelArgs
+
+    # No compatible mlx_lm TextModel for this architecture (e.g. mistral3 /
+    # Pixtral). Returning None makes build_text_model fall back to the MLLM
+    # stream_chat path instead of constructing a structurally-wrong qwen3_5
+    # model from foreign weights — which loaded without error but then crashed
+    # the text-route decode ("no Stream(gpu, N) in current thread") and would
+    # have produced garbage even if it hadn't.
+    return None, None
 
 
 def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
@@ -57,6 +66,13 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         text_config = config.get("text_config", config)
         model_type = text_config.get("model_type") or config.get("model_type", "")
         TextModel, TextModelArgs = _import_text_model_classes(model_type)
+        if TextModel is None:
+            logger.info(
+                "No mlx_lm TextModel for model_type=%r; using the MLLM "
+                "stream_chat path for text-only requests.",
+                model_type,
+            )
+            return None
 
         # Build args with proper __post_init__ (handles partial_rotary_factor,
         # rope_scaling, head_dim derivation)

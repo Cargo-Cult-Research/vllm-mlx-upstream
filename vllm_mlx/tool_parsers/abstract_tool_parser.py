@@ -114,10 +114,21 @@ class ToolParser(ABC):
 
     @cached_property
     def vocab(self) -> dict[str, int]:
-        """Get the tokenizer vocabulary."""
-        if self.model_tokenizer is None:
+        """Get the tokenizer vocabulary.
+
+        Multimodal processors (e.g. Mistral3Processor) wrap the text tokenizer
+        and don't expose get_vocab() directly — unwrap to .tokenizer. Tolerate
+        its absence entirely: string-matching parsers don't need a vocab, and
+        raising here makes the whole parser fail to init and silently fall back
+        to the generic parser (which is how Mistral Small 4 tool calls leaked).
+        """
+        tok = self.model_tokenizer
+        if tok is None:
             return {}
-        return self.model_tokenizer.get_vocab()
+        if not hasattr(tok, "get_vocab") and hasattr(tok, "tokenizer"):
+            tok = tok.tokenizer
+        get_vocab = getattr(tok, "get_vocab", None)
+        return get_vocab() if callable(get_vocab) else {}
 
     @abstractmethod
     def extract_tool_calls(

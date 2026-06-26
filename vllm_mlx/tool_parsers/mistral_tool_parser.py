@@ -2,11 +2,12 @@
 """
 Mistral tool call parser for vllm-mlx.
 
-Handles Mistral's tool calling format:
-- Format: [TOOL_CALLS] [{"name": "func", "arguments": {...}}]
-- Or newer: [TOOL_CALLS]func_name{"arg": "value"}
+Handles Mistral's tool calling formats:
+- Old (< v11):  [TOOL_CALLS] [{"name": "func", "arguments": {...}}]
+- New (>= v11): [TOOL_CALLS]func_name{"arg": "value"}
+- Tekken (Mistral Small 4): [TOOL_CALLS]func_name[ARGS]{"arg": "value"}
 
-Used with models like Mistral-7B-Instruct, Devstral, etc.
+Used with models like Mistral-7B-Instruct, Devstral, Mistral Small 4, etc.
 """
 
 import json
@@ -39,9 +40,10 @@ class MistralToolParser(ToolParser):
     """
     Tool call parser for Mistral models.
 
-    Supports both old and new Mistral tool call formats:
+    Supports old, new, and tekken Mistral tool call formats:
     - Old (< v11): [TOOL_CALLS] [{"name": "add", "arguments": {"a": 1, "b": 2}}]
     - New (>= v11): [TOOL_CALLS]add{"a": 1, "b": 2}
+    - Tekken (Small 4): [TOOL_CALLS]add[ARGS]{"a": 1, "b": 2}
 
     Used when --enable-auto-tool-choice --tool-call-parser mistral are set.
     """
@@ -55,6 +57,11 @@ class MistralToolParser(ToolParser):
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
         self.bot_token_id = self.vocab.get(self.BOT_TOKEN) if self.vocab else None
+        # Streaming: once the args JSON has started for the current tool call,
+        # every later delta is arguments — not a new name. Without this, a
+        # continuation like `"Paris"}` (no separator, starts with a quote) was
+        # misclassified as a tool name, mangling streamed tool calls.
+        self._stream_args_started = False
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -84,6 +91,23 @@ class MistralToolParser(ToolParser):
         for raw_tool_call in raw_tool_calls:
             raw_tool_call = raw_tool_call.strip()
             if not raw_tool_call:
+                continue
+
+            # Tekken format (Mistral Small 4 / v11+): func_name[ARGS]{"arg": "value"}
+            # The name and JSON args are separated by a literal [ARGS] control
+            # token; splitting on "{" (below) would fold [ARGS] into the name.
+            if "[ARGS]" in raw_tool_call:
+                name_part, args_part = raw_tool_call.split("[ARGS]", 1)
+                tool_name = name_part.strip()
+                args_str = args_part.strip()
+                if tool_name:
+                    tool_calls.append(
+                        {
+                            "id": generate_mistral_tool_id(),
+                            "name": tool_name,
+                            "arguments": args_str,
+                        }
+                    )
                 continue
 
             # Try new format first: func_name{"arg": "value"}
@@ -200,11 +224,14 @@ class MistralToolParser(ToolParser):
 
             # Start tracking tool call
             self.current_tool_id += 1
+            self._stream_args_started = False
 
             if tool_part:
                 # Try to parse the tool part
                 tool_delta = self._parse_streaming_tool_delta(tool_part)
                 if tool_delta:
+                    if "arguments" in tool_delta:
+                        self._stream_args_started = True
                     result["tool_calls"] = [
                         {
                             "index": self.current_tool_id,
@@ -218,8 +245,25 @@ class MistralToolParser(ToolParser):
 
         # We're in the middle of a tool call
         if self.current_tool_id >= 0:
+            if self._stream_args_started:
+                # The args JSON is underway; everything now is arguments. Re-
+                # parsing per-delta would misread a continuation like `"Paris"}`
+                # as a new tool name.
+                if not delta_text:
+                    return None
+                return {
+                    "tool_calls": [
+                        {
+                            "index": self.current_tool_id,
+                            "type": "function",
+                            "function": {"arguments": delta_text},
+                        }
+                    ]
+                }
             tool_delta = self._parse_streaming_tool_delta(delta_text)
             if tool_delta:
+                if "arguments" in tool_delta:
+                    self._stream_args_started = True
                 return {
                     "tool_calls": [
                         {
@@ -238,6 +282,15 @@ class MistralToolParser(ToolParser):
             return None
 
         result: dict[str, str] = {}
+
+        # Tekken format separator: name[ARGS]{json}
+        if "[ARGS]" in text:
+            name_part, args_part = text.split("[ARGS]", 1)
+            if name_part.strip():
+                result["name"] = name_part.strip()
+            if args_part:
+                result["arguments"] = args_part
+            return result if result else None
 
         # Check for function name (before {)
         if "{" in text:

@@ -139,6 +139,69 @@ class TestMistralToolParser:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0]["name"] == "get_weather"
 
+    def test_tekken_format_single(self, parser):
+        """Test parsing tekken format (Mistral Small 4): name[ARGS]{json}."""
+        text = '[TOOL_CALLS]get_weather[ARGS]{"city": "Berlin"}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["city"] == "Berlin"
+
+    def test_tekken_format_name_not_folded_into_args(self, parser):
+        """The [ARGS] separator must not be swallowed into the tool name."""
+        text = '[TOOL_CALLS]bash[ARGS]{"command": "ls -la /tmp"}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "bash"
+        assert "[ARGS]" not in result.tool_calls[0]["name"]
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["command"] == "ls -la /tmp"
+
+    def test_tekken_streaming_args_not_misread_as_name(self, parser):
+        """Streaming tekken: continuation deltas are arguments, not a 2nd name.
+
+        Regression: `[TOOL_CALLS]get_weather[ARGS]{"city":"Paris"}` streamed in
+        two deltas mangled into name=['get_weather', '"Paris"}'] / args='{"city":'
+        because the stateless delta parser re-guessed name vs args each chunk.
+        """
+        deltas = ['[TOOL_CALLS]get_weather[ARGS]{"city":', '"Paris"}']
+        prev = ""
+        names, args = [], ""
+        for d in deltas:
+            cur = prev + d
+            out = parser.extract_tool_calls_streaming(prev, cur, d)
+            prev = cur
+            if out and out.get("tool_calls"):
+                fn = out["tool_calls"][0]["function"]
+                if fn.get("name"):
+                    names.append(fn["name"])
+                if fn.get("arguments"):
+                    args += fn["arguments"]
+        assert names == ["get_weather"]
+        assert json.loads(args) == {"city": "Paris"}
+
+    def test_tekken_streaming_name_args_split_across_deltas(self, parser):
+        """The [ARGS] separator and JSON may land in separate deltas."""
+        deltas = ["[TOOL_CALLS]bash", "[ARGS]", '{"command":', '"ls"}']
+        prev = ""
+        names, args = [], ""
+        for d in deltas:
+            cur = prev + d
+            out = parser.extract_tool_calls_streaming(prev, cur, d)
+            prev = cur
+            if out and out.get("tool_calls"):
+                fn = out["tool_calls"][0]["function"]
+                if fn.get("name"):
+                    names.append(fn["name"])
+                if fn.get("arguments"):
+                    args += fn["arguments"]
+        assert names == ["bash"]
+        assert json.loads(args) == {"command": "ls"}
+
     def test_no_tool_call(self, parser):
         """Test that regular text is not parsed as tool call."""
         text = "Hello, how can I help you today?"
