@@ -8,6 +8,8 @@ These are pure logic tests with no MLX dependency.
 
 import json
 
+import pytest
+
 from vllm_mlx.api.anthropic_adapter import (
     _convert_message,
     _convert_stop_reason,
@@ -392,6 +394,31 @@ class TestAnthropicToOpenai:
         assert result.messages[0].content == "Answer in one word."
         assert result.messages[1].role == "user"
         assert result.messages[1].content == "hi"
+
+    @pytest.mark.parametrize(
+        "content",
+        ["", [], [AnthropicContentBlock(type="text", text="")]],
+        ids=["string", "empty-blocks", "text-block"],
+    )
+    def test_empty_system_messages_merge_to_single_leading_system(self, content):
+        req = self._make_request(
+            messages=[
+                AnthropicMessage(role="user", content="hello"),
+                AnthropicMessage(role="system", content=content),
+                AnthropicMessage(role="assistant", content="hi"),
+                AnthropicMessage(role="system", content=content),
+                AnthropicMessage(role="user", content="continue"),
+            ]
+        )
+
+        result = anthropic_to_openai(req)
+
+        assert [(message.role, message.content) for message in result.messages] == [
+            ("system", ""),
+            ("user", "hello"),
+            ("assistant", "hi"),
+            ("user", "continue"),
+        ]
 
     def test_multiple_system_messages_preserve_system_and_turn_order(self):
         msgs = [

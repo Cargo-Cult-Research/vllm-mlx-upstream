@@ -61,9 +61,8 @@ def _merge_system_messages(messages: list[Message]) -> list[Message]:
         if text
     ]
     non_system = [message for message in messages if message.role != "system"]
-    if not system_texts:
-        return non_system
 
+    # Preserve an explicit system message even if canonicalization emptied it.
     return [Message(role="system", content="\n\n".join(system_texts)), *non_system]
 
 
