@@ -757,7 +757,9 @@ def _download_media(
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
     }
 
-    logger.info(f"Downloading {media_type} from: {url}")
+    # URLs may contain credentials or signed query parameters. Keep request
+    # targets out of normal logs while retaining useful operation context.
+    logger.info("Downloading remote %s", media_type)
 
     try:
         head_response = _request_with_safe_redirects(
@@ -1319,6 +1321,7 @@ class MLXMultimodalLM:
         draft_model: str | None = None,
         draft_kind: str | None = None,
         draft_block_size: int | None = None,
+        default_draft_enabled: bool = False,
     ):
         """
         Initialize the MLX multimodal language model.
@@ -1340,6 +1343,7 @@ class MLXMultimodalLM:
         self.draft_model_path = draft_model
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
+        self.default_draft_enabled = default_draft_enabled
 
         self.model = None
         self.processor = None
@@ -1409,15 +1413,15 @@ class MLXMultimodalLM:
         return draft_model
 
     def _draft_generation_kwargs(self, call_kwargs: dict | None = None) -> dict:
-        """Return mlx-vlm drafter kwargs when the request explicitly opts in.
+        """Return mlx-vlm drafter kwargs when the request enables the drafter.
 
         ``call_kwargs`` is the outbound mlx-vlm kwargs dict. This method removes
         vllm-mlx drafter control keys before the dict is forwarded so caller
         passthrough values cannot conflict with the configured server drafter.
         """
-        draft_requested = False
+        draft_requested = self.default_draft_enabled
         if call_kwargs is not None:
-            draft_requested = bool(call_kwargs.pop("mllm_draft", False))
+            draft_requested = bool(call_kwargs.pop("mllm_draft", draft_requested))
             for key in _DRAFT_KWARG_NAMES:
                 call_kwargs.pop(key, None)
         if not draft_requested or self._draft_model is None:
@@ -1481,25 +1485,11 @@ class MLXMultimodalLM:
 
     def _prepare_images(self, images: list) -> list[str]:
         """Process remote/base64 image inputs into local temp file paths."""
-        processed = []
-        for img in images:
-            try:
-                path = process_image_input(img)
-                processed.append(path)
-            except Exception as e:
-                logger.warning(f"Failed to process image: {e}")
-        return processed
+        return [process_image_input(image) for image in images]
 
     def _prepare_audio(self, audio_inputs: list) -> list[str]:
         """Process audio inputs and return local file paths."""
-        processed = []
-        for audio_input in audio_inputs:
-            try:
-                path = process_audio_input(audio_input)
-                processed.append(path)
-            except Exception as e:
-                logger.warning(f"Failed to process audio: {e}")
-        return processed
+        return [process_audio_input(audio_input) for audio_input in audio_inputs]
 
     def _prepare_video(
         self,

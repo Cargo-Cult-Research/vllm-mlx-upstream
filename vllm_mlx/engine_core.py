@@ -157,6 +157,10 @@ class EngineCore:
         if self._running:
             return
 
+        ensure_ssd_tier = getattr(self.scheduler, "ensure_ssd_tier", None)
+        if ensure_ssd_tier is not None:
+            await asyncio.to_thread(ensure_ssd_tier)
+
         self._running = True
         self._request_event = asyncio.Event()
         self._start_time = time.time()
@@ -166,17 +170,21 @@ class EngineCore:
     async def stop(self) -> None:
         """Stop the engine loop."""
         self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        try:
+            if self._task:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+        finally:
             self._task = None
-        # Safety net: close batch generator if _engine_loop didn't get a
-        # chance to clean up (e.g. it was never started).  The call is
-        # idempotent — _close_batch_generator checks for None.
-        self.scheduler._close_batch_generator()
+            # Safety nets for a loop that never started or whose cleanup
+            # raised. Both operations are idempotent.
+            try:
+                self.scheduler._close_batch_generator()
+            finally:
+                await asyncio.to_thread(self.scheduler.close_ssd_tier)
         logger.info("Engine stopped")
 
     def is_running(self) -> bool:
@@ -335,12 +343,22 @@ class EngineCore:
                                     if use_simple_streaming:
                                         collector.put(req_output)
                                     else:
+                                        # Always put so the collector accumulates
+                                        # every step's new_text; only *release*
+                                        # (notify) on the interval boundary or on
+                                        # finish. Gating the put instead would drop
+                                        # the in-between tokens' text entirely.
                                         state = states.get(rid)
-                                        if state and state.should_send(
-                                            req_output.completion_tokens,
-                                            req_output.finished,
-                                        ):
-                                            collector.put(req_output)
+                                        send = (
+                                            state.should_send(
+                                                req_output.completion_tokens,
+                                                req_output.finished,
+                                            )
+                                            if state
+                                            else True
+                                        )
+                                        collector.put(req_output, notify=send)
+                                        if send and state:
                                             state.mark_sent(
                                                 req_output.completion_tokens
                                             )
@@ -385,10 +403,15 @@ class EngineCore:
                 else:
                     self.scheduler._close_batch_generator()
             finally:
-                # Only tear down a worker this loop created. A caller-supplied
-                # one owns the loaded model and outlives the engine loop.
-                if owns_worker:
-                    worker.shutdown(wait=True)
+                # Close the SSD writer before joining the worker so any
+                # queued spills flush while the engine is still alive.
+                try:
+                    await asyncio.to_thread(self.scheduler.close_ssd_tier)
+                finally:
+                    # Only tear down a worker this loop created. A caller-supplied
+                    # one owns the loaded model and outlives the engine loop.
+                    if owns_worker:
+                        worker.shutdown(wait=True)
 
     async def add_request(
         self,

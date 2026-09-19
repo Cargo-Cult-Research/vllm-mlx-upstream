@@ -77,6 +77,8 @@ class MLLMSchedulerConfig:
     use_memory_aware_cache: bool = True
     # Memory limit for prefix cache (None = auto-detect)
     prefix_cache_memory_mb: Optional[int] = None
+    # Fraction of available memory used when no explicit MB limit is configured
+    prefix_cache_memory_percent: float = 0.20
     # KV cache quantization for prefix cache store/fetch
     kv_cache_quantization: bool = False
     kv_cache_quantization_bits: int = 8
@@ -106,6 +108,7 @@ class MLLMRequest:
     videos: Optional[List[str]] = None
     audio: Optional[List[str]] = None
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
+    mllm_draft: bool = False
     arrival_time: float = field(default_factory=time.time)
 
     # Batch generator UID (assigned when scheduled)
@@ -185,6 +188,9 @@ class MLLMScheduler:
         model: Any,
         processor: Any,
         config: Optional[MLLMSchedulerConfig] = None,
+        draft_model: Any = None,
+        draft_kind: Optional[str] = None,
+        draft_block_size: Optional[int] = None,
     ):
         """
         Initialize MLLM scheduler.
@@ -197,6 +203,9 @@ class MLLMScheduler:
         self.model = model
         self.processor = processor
         self.config = config or MLLMSchedulerConfig()
+        self.draft_model = draft_model
+        self.draft_kind = draft_kind
+        self.draft_block_size = draft_block_size
 
         # Get model config
         self.model_config = getattr(model, "config", None)
@@ -213,6 +222,10 @@ class MLLMScheduler:
 
         # Batch generator (created lazily)
         self.batch_generator: Optional[MLLMBatchGenerator] = None
+        # SSD cold tier, wired onto the batch generator's prefix cache lazily
+        # in _ensure_batch_generator() — initialized here so stop() can
+        # safely check it even if no request ever ran.
+        self._ssd_tier: Optional[Any] = None
 
         # Request management - following vLLM's design
         self.waiting: deque[MLLMRequest] = deque()  # Waiting queue (FCFS)
@@ -280,6 +293,7 @@ class MLLMScheduler:
             if self.config.enable_prefix_cache and self.config.use_memory_aware_cache:
                 prefix_cache_config = MemoryCacheConfig(
                     max_memory_mb=self.config.prefix_cache_memory_mb,
+                    max_memory_percent=self.config.prefix_cache_memory_percent,
                     kv_quantize=self.config.kv_cache_quantization,
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
@@ -335,7 +349,24 @@ class MLLMScheduler:
                 )
 
             # Install MTP if enabled and language model supports it
-            if self.config.enable_mtp:
+            draft_model = getattr(self, "draft_model", None)
+            if draft_model is not None:
+                if getattr(self, "draft_kind", None) != "mtp":
+                    raise ValueError(
+                        "Continuous-batching assistant drafters require draft_kind='mtp'"
+                    )
+                from .mllm_batch_generator import install_mtp_mllm
+
+                install_mtp_mllm(
+                    self.batch_generator,
+                    self.batch_generator.language_model,
+                    num_draft_tokens=max(
+                        1, (getattr(self, "draft_block_size", None) or 2) - 1
+                    ),
+                    draft_model=draft_model,
+                    draft_block_size=getattr(self, "draft_block_size", None),
+                )
+            elif self.config.enable_mtp:
                 lm = self.batch_generator.language_model
                 if hasattr(lm, "mtp") and lm.mtp is not None:
                     from .mllm_batch_generator import install_mtp_mllm
@@ -400,6 +431,7 @@ class MLLMScheduler:
             videos=videos,
             audio=audio,
             sampling_params=sampling_params,
+            mllm_draft=bool(kwargs.pop("mllm_draft", False)),
         )
 
         # Estimate prompt token count for monitoring (text tokens only;
@@ -547,6 +579,7 @@ class MLLMScheduler:
                 presence_penalty=request.sampling_params.presence_penalty,
                 repetition_penalty=request.sampling_params.repetition_penalty,
                 logits_processors=request.sampling_params.logits_processors,
+                mllm_draft=request.mllm_draft,
             )
             batch_requests.append(batch_req)
 
@@ -785,6 +818,47 @@ class MLLMScheduler:
 
         return output
 
+    def _fail_requests_after_step_error(self, error: Exception) -> None:
+        """Terminate every request that may share a partially mutated batch.
+
+        A model forward can update earlier cache layers before a later layer
+        raises. Retrying that batch is unsafe and previously produced an
+        infinite exception loop while streaming clients received heartbeats.
+        """
+        request_ids = list(self.requests)
+        logger.error(
+            "Failing %d MLLM requests after an unrecoverable scheduler step: %s",
+            len(request_ids),
+            error,
+        )
+        for request_id in request_ids:
+            request = self.requests.get(request_id)
+            queue = self.output_queues.get(request_id)
+            if request is not None and queue is not None:
+                try:
+                    queue.put_nowait(
+                        RequestOutput(
+                            request_id=request_id,
+                            output_token_ids=list(request.output_tokens),
+                            output_text=request.output_text,
+                            finished=True,
+                            finish_reason="error",
+                            prompt_tokens=request.num_prompt_tokens,
+                            completion_tokens=request.num_output_tokens,
+                            mtp_drafts=request.mtp_drafts,
+                            mtp_accepted=request.mtp_accepted,
+                        )
+                    )
+                except asyncio.QueueFull:
+                    pass
+            self.abort_request(request_id)
+
+        # abort_request defers batch mutation for thread safety. This handler
+        # runs on the scheduler loop after the failed forward has unwound, so
+        # draining now is both safe and necessary before any later request.
+        if self.batch_generator is not None:
+            self.batch_generator.process_pending_removals()
+
     def get_request(self, request_id: str) -> Optional[MLLMRequest]:
         """Get a request by ID."""
         return self.requests.get(request_id)
@@ -819,6 +893,17 @@ class MLLMScheduler:
         if self.batch_generator is not None:
             self.batch_generator.close()
             self.batch_generator = None
+
+        if self._ssd_tier is not None:
+            tier = self._ssd_tier
+            aclose = getattr(tier, "aclose", None)
+            if aclose is not None:
+                await aclose()
+            else:
+                await asyncio.to_thread(tier.close)
+            if self._ssd_tier is tier:
+                self._ssd_tier = None
+            logger.info("SSD cache tier closed")
 
         logger.info("MLLM Scheduler stopped")
 
@@ -917,6 +1002,7 @@ class MLLMScheduler:
                 raise
             except Exception as e:
                 logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
+                self._fail_requests_after_step_error(e)
                 await asyncio.sleep(0.1)
 
     async def add_request_async(
@@ -1182,8 +1268,11 @@ class MLLMScheduler:
             "vision_cache": False,
             "prefix_cache": False,
         }
-        if self.vision_cache:
-            self.vision_cache.clear()
+        if (
+            self.batch_generator is not None
+            and self.batch_generator.vision_cache is not None
+        ):
+            self.batch_generator.vision_cache.clear()
             cleared["vision_cache"] = True
         if (
             self.batch_generator is not None
@@ -1208,8 +1297,7 @@ class MLLMScheduler:
         self._detokenizer_pool.clear()
 
         if self.batch_generator is not None:
+            if self.batch_generator.vision_cache is not None:
+                self.batch_generator.vision_cache.clear()
             self.batch_generator.close()
             self.batch_generator = None
-
-        if self.vision_cache:
-            self.vision_cache.clear()

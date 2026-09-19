@@ -20,6 +20,7 @@ from .cli_arg_types import (
     make_auto_or_positive_int_arg_parser,
     make_json_object_arg_parser,
     make_positive_int_arg_parser,
+    memory_budget_gb_arg,
 )
 from .tool_parsers import ToolParserManager
 
@@ -61,6 +62,7 @@ def serve_command(args):
     logger = logging.getLogger(__name__)
     model_arg = getattr(args, "model", None)
     models_config = getattr(args, "models_config", None)
+    memory_budget_gb = getattr(args, "memory_budget_gb", None)
 
     if models_config and model_arg:
         print("Error: use either positional MODEL or --models-config, not both")
@@ -70,6 +72,9 @@ def serve_command(args):
         sys.exit(1)
     if models_config and args.served_model_name:
         print("Error: --served-model-name cannot be used with --models-config")
+        sys.exit(1)
+    if memory_budget_gb is not None and not models_config:
+        print("Error: --memory-budget-gb requires --models-config")
         sys.exit(1)
 
     # Validate tool calling arguments
@@ -99,19 +104,24 @@ def serve_command(args):
     mllm_draft_model = getattr(args, "mllm_draft_model", None)
     mllm_draft_kind = getattr(args, "mllm_draft_kind", None)
     mllm_draft_block_size = getattr(args, "mllm_draft_block_size", None)
+    default_mllm_draft = getattr(args, "default_mllm_draft", False)
     if mllm_draft_model and models_config:
         print("Error: --mllm-draft-model cannot be used with --models-config")
         sys.exit(1)
     if mllm_draft_model and not getattr(args, "mllm", False):
         print("Error: --mllm-draft-model requires --mllm")
         sys.exit(1)
+    if default_mllm_draft and not mllm_draft_model:
+        print("Error: --default-mllm-draft requires --mllm-draft-model")
+        sys.exit(1)
+    if mllm_draft_model and args.continuous_batching and mllm_draft_kind != "mtp":
+        print(
+            "Error: --mllm-draft-model with --continuous-batching "
+            "requires --mllm-draft-kind mtp"
+        )
+        sys.exit(1)
     if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
         print("Error: --mllm-draft-block-size must be a positive integer")
-        sys.exit(1)
-    if mllm_draft_model and args.continuous_batching:
-        print(
-            "Error: --mllm-draft-model is supported only without --continuous-batching"
-        )
         sys.exit(1)
     if mllm_draft_model and (args.auto_unload_idle_seconds > 0 or args.lazy_load_model):
         print("Error: --mllm-draft-model is not supported with lifecycle residency yet")
@@ -289,6 +299,7 @@ def serve_command(args):
         scheduler_config = SchedulerConfig(
             max_num_seqs=args.max_num_seqs,
             prefill_batch_size=args.prefill_batch_size,
+            prefill_step_size=args.prefill_step_size,
             completion_batch_size=args.completion_batch_size,
             enable_prefix_cache=enable_prefix_cache,
             prefix_cache_size=args.prefix_cache_size,
@@ -377,7 +388,8 @@ def serve_command(args):
             print(
                 "MLLM draft model: enabled "
                 f"(draft={mllm_draft_model}, kind={mllm_draft_kind}, "
-                f"block_size={mllm_draft_block_size})"
+                f"block_size={mllm_draft_block_size}, "
+                f"default_enabled={default_mllm_draft})"
             )
 
     if models_config:
@@ -399,8 +411,13 @@ def serve_command(args):
             scheduler_config=scheduler_config,
             max_tokens=args.max_tokens,
             download_config=download_config,
+            auto_unload_idle_seconds=args.auto_unload_idle_seconds,
         )
-        load_model_registry(models_config, defaults=defaults)
+        load_model_registry(
+            models_config,
+            defaults=defaults,
+            memory_budget_gb=memory_budget_gb,
+        )
     else:
         # Load model with unified server
         load_model(
@@ -427,6 +444,7 @@ def serve_command(args):
             mllm_draft_model=mllm_draft_model,
             mllm_draft_kind=mllm_draft_kind,
             mllm_draft_block_size=mllm_draft_block_size,
+            default_mllm_draft=default_mllm_draft,
             warm_prompts_path=getattr(args, "warm_prompts", None),
             auto_unload_idle_seconds=args.auto_unload_idle_seconds,
             lazy_load_model=args.lazy_load_model,
@@ -1057,6 +1075,16 @@ Examples:
         help="YAML file describing a registry of models for lazy multi-model serving",
     )
     serve_parser.add_argument(
+        "--memory-budget-gb",
+        type=memory_budget_gb_arg,
+        default=None,
+        help=(
+            "Override the registry manager model-weight residency budget in GB. "
+            "This is not a total runtime-memory limit and does not guarantee "
+            "prevention of Metal/MLX OOM."
+        ),
+    )
+    serve_parser.add_argument(
         "--served-model-name",
         type=str,
         default=None,
@@ -1261,7 +1289,7 @@ Examples:
     # Prefill step size
     serve_parser.add_argument(
         "--prefill-step-size",
-        type=int,
+        type=make_positive_int_arg_parser("--prefill-step-size"),
         default=2048,
         help="Chunk size for prompt prefill processing. Larger values use more memory "
         "but can improve prefill throughput. (default: 2048)",
@@ -1345,6 +1373,14 @@ Examples:
         default=None,
         help="Draft block size passed to mlx-vlm for --mllm-draft-model.",
     )
+    serve_parser.add_argument(
+        "--default-mllm-draft",
+        action="store_true",
+        help=(
+            "Enable a configured MLLM assistant drafter by default. "
+            "Requests may opt out with mllm_draft=false."
+        ),
+    )
     # MCP options
     serve_parser.add_argument(
         "--mcp-config",
@@ -1380,7 +1416,7 @@ Examples:
         "--auto-unload-idle-seconds",
         type=float,
         default=0.0,
-        help="Unload the main model after this many idle seconds (0 = disabled)",
+        help="Unload idle models after this many seconds (0 = disabled)",
     )
     serve_parser.add_argument(
         "--lazy-load-model",

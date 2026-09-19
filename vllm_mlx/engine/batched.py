@@ -20,6 +20,8 @@ from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import mlx.core as mx
+
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
 from .base import (
@@ -62,80 +64,6 @@ def _resolve_metal_buffer_cache_limit(
 def _normalize_tool_call_arguments_for_template(messages: list[dict]) -> list[dict]:
     """Normalize OpenAI tool-call replay for templates expecting mappings."""
     return normalize_messages_for_chat_template(messages)
-
-
-def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
-    """
-    Extract images, videos, and audio from OpenAI-format messages.
-
-    Returns:
-        Tuple of (has_media, images_list, videos_list, audios_list)
-    """
-    images = []
-    videos = []
-    audios = []
-
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-
-        for item in content:
-            # Handle Pydantic models
-            if hasattr(item, "model_dump"):
-                item = item.model_dump(exclude_none=True)
-            elif hasattr(item, "dict"):
-                item = {k: v for k, v in item.dict().items() if v is not None}
-
-            if not isinstance(item, dict):
-                continue
-
-            item_type = item.get("type", "")
-
-            if item_type == "image_url":
-                img_url = item.get("image_url", {})
-                if isinstance(img_url, str):
-                    images.append(img_url)
-                elif isinstance(img_url, dict):
-                    url = img_url.get("url", "")
-                    if url:
-                        images.append(url)
-
-            elif item_type == "image":
-                img = item.get("image") or item.get("url", "")
-                if img:
-                    images.append(img)
-
-            elif item_type == "video_url":
-                vid_url = item.get("video_url", {})
-                if isinstance(vid_url, str):
-                    videos.append(vid_url)
-                elif isinstance(vid_url, dict):
-                    url = vid_url.get("url", "")
-                    if url:
-                        videos.append(url)
-
-            elif item_type == "video":
-                vid = item.get("video") or item.get("url", "")
-                if vid:
-                    videos.append(vid)
-
-            elif item_type == "audio_url":
-                audio_url = item.get("audio_url", {})
-                if isinstance(audio_url, str):
-                    audios.append(audio_url)
-                elif isinstance(audio_url, dict):
-                    url = audio_url.get("url", "")
-                    if url:
-                        audios.append(url)
-
-            elif item_type == "audio":
-                audio = item.get("audio") or item.get("url", "")
-                if audio:
-                    audios.append(audio)
-
-    has_media = bool(images or videos or audios)
-    return has_media, images, videos, audios
 
 
 class MLLMModelWrapper:
@@ -195,6 +123,10 @@ class BatchedEngine(BaseEngine):
         stream_interval: int = 1,
         force_mllm: bool = False,
         gpu_memory_utilization: float = 0.90,
+        mllm_draft_model: str | None = None,
+        mllm_draft_kind: str | None = None,
+        mllm_draft_block_size: int | None = None,
+        default_mllm_draft: bool = False,
     ):
         """
         Initialize the batched engine.
@@ -207,6 +139,8 @@ class BatchedEngine(BaseEngine):
             force_mllm: Force loading as MLLM even if not auto-detected
             gpu_memory_utilization: Fraction of device memory for Metal allocation
                 limit and emergency threshold (0.0-1.0, default 0.90)
+            default_mllm_draft: Enable the configured assistant drafter unless a
+                request explicitly sets ``mllm_draft`` to false.
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -214,6 +148,10 @@ class BatchedEngine(BaseEngine):
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
         self._gpu_memory_utilization = gpu_memory_utilization
+        self._mllm_draft_model = mllm_draft_model
+        self._mllm_draft_kind = mllm_draft_kind
+        self._mllm_draft_block_size = mllm_draft_block_size
+        self._default_mllm_draft = default_mllm_draft
         self._is_mllm = force_mllm or is_mllm_model(model_name)
 
         self._model = None
@@ -343,6 +281,9 @@ class BatchedEngine(BaseEngine):
             self._model_name,
             trust_remote_code=self._trust_remote_code,
             max_kv_size=max_kv_size,
+            draft_model=self._mllm_draft_model,
+            draft_kind=self._mllm_draft_kind,
+            draft_block_size=self._mllm_draft_block_size,
         )
         self._mllm_instance.load()
         self._model = self._mllm_instance.model
@@ -378,7 +319,11 @@ class BatchedEngine(BaseEngine):
             logger.warning(f"Failed to set Metal memory limits: {e}")
 
         # Inject MTP support if enabled
-        if self._scheduler_config and self._scheduler_config.enable_mtp:
+        if (
+            self._scheduler_config
+            and self._scheduler_config.enable_mtp
+            and self._mllm_draft_model is None
+        ):
             self._inject_mtp_mllm()
 
     async def _start_mllm(self) -> None:
@@ -410,6 +355,9 @@ class BatchedEngine(BaseEngine):
         )
         prefix_cache_memory_mb = getattr(
             self._scheduler_config, "cache_memory_mb", None
+        )
+        prefix_cache_memory_percent = getattr(
+            self._scheduler_config, "cache_memory_percent", 0.20
         )
         enable_mtp = (
             self._scheduler_config.enable_mtp if self._scheduler_config else False
@@ -449,6 +397,7 @@ class BatchedEngine(BaseEngine):
             enable_prefix_cache=enable_prefix_cache,
             use_memory_aware_cache=use_memory_aware_cache,
             prefix_cache_memory_mb=prefix_cache_memory_mb,
+            prefix_cache_memory_percent=prefix_cache_memory_percent,
             enable_mtp=enable_mtp,
             mtp_num_draft_tokens=mtp_num_draft,
             kv_cache_quantization=kv_quant,
@@ -462,10 +411,18 @@ class BatchedEngine(BaseEngine):
         )
 
         # Create and start MLLM scheduler
+        scheduler_kwargs = {}
+        if self._mllm_draft_model is not None:
+            scheduler_kwargs = {
+                "draft_model": getattr(self._mllm_instance, "_draft_model", None),
+                "draft_kind": self._mllm_draft_kind,
+                "draft_block_size": self._mllm_draft_block_size,
+            }
         self._mllm_scheduler = MLLMScheduler(
             model=self._model,
             processor=self._processor,
             config=mllm_config,
+            **scheduler_kwargs,
         )
         await self._mllm_scheduler.start()
 
@@ -647,6 +604,7 @@ class BatchedEngine(BaseEngine):
             # The model and its streams lived on this thread; both go with it.
             self._generation_executor.shutdown(wait=True)
             self._generation_executor = None
+        mx.clear_cache()
         logger.info("BatchedEngine stopped")
 
     def _apply_chat_template(
@@ -827,6 +785,7 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                mllm_draft=bool(kwargs.pop("mllm_draft", self._default_mllm_draft)),
             )
 
             return GenerationOutput(
@@ -916,6 +875,7 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                mllm_draft=bool(kwargs.pop("mllm_draft", self._default_mllm_draft)),
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
@@ -1213,6 +1173,19 @@ class BatchedEngine(BaseEngine):
             ):
                 if key in mllm_stats:
                     stats[key] = mllm_stats[key]
+            if self._mllm_draft_model is not None:
+                mtp_stats = stats.setdefault("mtp", {})
+                mtp_stats.setdefault("enabled", True)
+                mtp_stats.setdefault("implementation", "external_assistant")
+                mtp_stats.update(
+                    {
+                        "draft_model": self._mllm_draft_model,
+                        "draft_kind": self._mllm_draft_kind,
+                        "draft_block_size": self._mllm_draft_block_size,
+                        "default_enabled": self._default_mllm_draft,
+                        "continuous_batching_supported": True,
+                    }
+                )
             # MLLM engine is always "running" once loaded
             if "running" not in stats:
                 stats["running"] = self._loaded

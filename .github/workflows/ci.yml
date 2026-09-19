@@ -23,10 +23,10 @@ jobs:
           pip install ruff black
 
       - name: Run ruff
-        run: ruff check vllm_mlx/ tests/ --select E,F,W --ignore E402,E501,E731,F811,F841
+        run: ruff check vllm_mlx/ tests/ scripts/client_acceptance/ --select E,F,W --ignore E402,E501,E731,F811,F841
 
       - name: Run black
-        run: black --check vllm_mlx/ tests/
+        run: black --check vllm_mlx/ tests/ scripts/client_acceptance/
 
   type-check:
     runs-on: ubuntu-latest
@@ -68,6 +68,9 @@ jobs:
       - name: Run unit tests (no MLX required)
         run: |
           pytest \
+            tests/test_client_acceptance_runner.py \
+            tests/test_client_acceptance_clients.py \
+            tests/test_client_acceptance_observe.py \
             tests/test_mcp_security.py \
             tests/test_structured_output.py \
             tests/test_reasoning_parser.py \
@@ -82,8 +85,12 @@ jobs:
             tests/test_request.py \
             tests/test_anthropic_models.py \
             tests/test_anthropic_adapter.py \
+            tests/test_anthropic_adapter_canonicalization.py \
             tests/test_dependency_floors.py \
+            tests/test_ssd_cache_shutdown.py \
+            tests/test_chat_template_safety.py \
             tests/test_simple_engine_thread_pinning.py \
+            tests/test_engine_base.py \
             tests/test_harmony_parsers.py \
             tests/test_endpoint_model_policies.py \
             tests/test_truncation.py \
@@ -91,6 +98,9 @@ jobs:
             tests/test_gemma4_openai_format.py \
             tests/test_gemma4_streaming_edge.py \
             tests/test_gemma4_tool_parser.py \
+            tests/test_deepseek_v4_encoding.py \
+            tests/test_deepseek_v4_reasoning.py \
+            tests/test_deepseek_v4_tool_parser.py \
             tests/test_minimax_tool_calling.py \
             tests/test_qwen3_xml_parser.py \
             tests/test_qwen3_xml_registration.py \
@@ -112,6 +122,28 @@ jobs:
         with:
           file: ./coverage.xml
           fail_ci_if_error: false
+
+  test-python-3-14:
+    # Focused job for the CPython 3.14+ asyncio.shield() behavior change
+    # that shield_task() (vllm_mlx/engine/base.py) works around -- the
+    # regular test-matrix only covers 3.10-3.13, none of which reproduce it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest anyio pytest-cov
+
+      - name: Run engine base tests
+        run: |
+          pytest tests/test_engine_base.py -v --tb=short
 
   test-apple-silicon:
     runs-on: macos-14
@@ -143,19 +175,27 @@ jobs:
             tests/test_llm.py \
             tests/test_mllm.py \
             tests/test_server.py \
+            tests/test_metrics.py \
             tests/test_paged_cache.py \
             tests/test_prefix_cache_untrimmable.py \
+            tests/test_scheduler_max_kv_size.py \
             tests/test_qwen35_mtp_patch.py \
+            tests/test_batched_engine_mllm_config.py \
             tests/test_mllm_continuous_batching.py \
             tests/test_mllm_cache.py \
             tests/test_optimizations.py \
             tests/test_simple_engine.py \
             tests/test_simple_engine_prefix_trie_cache.py \
             tests/test_text_model_dispatch.py \
+            tests/test_cli.py \
+            tests/test_model_registry.py \
             tests/test_chat_template_kwargs.py \
             tests/test_batching.py \
             tests/test_continuous_batching.py \
             tests/test_memory_cache_mlx.py \
+            tests/test_mllm_ssd_spill.py \
+            tests/test_ssd_cache.py \
+            tests/test_ssd_shutdown_wiring.py \
             tests/test_lifecycle_cli.py \
             tests/test_lifecycle_server.py \
             tests/test_normalize_messages.py \
@@ -170,19 +210,33 @@ jobs:
             -m "not slow" \
             -k "not Integration"
 
+      - name: Run streaming text-with-tool-calls regression tests
+        run: |
+          # Kept out of the list above because that invocation filters with
+          # -k "not Integration", which would deselect the endpoint file by
+          # name and silently skip every regression in it.
+          pytest \
+            tests/test_streaming_content_with_tool_calls.py \
+            tests/test_streaming_content_with_tool_calls_integration.py \
+            -v --tb=short \
+            -m "not slow"
+
       - name: Run EngineCore stream-affinity regression tests
         run: |
           # Fresh process so globals like mlx_lm.generate.generation_stream
           # are not rebound by earlier tests (see issue #407).
           pytest \
             tests/test_batching_deterministic.py \
+            tests/test_batched_engine_owner_thread.py \
+            tests/test_engine_core_idle_polling.py \
             tests/test_engine_core_stream_safety.py \
+            tests/test_engine_core_thread_streams.py \
             -v --tb=short \
             -m "not slow" \
             -k "not Integration"
 
   tests:
-    needs: [test-matrix, test-apple-silicon]
+    needs: [test-matrix, test-python-3-14, test-apple-silicon]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -190,6 +244,10 @@ jobs:
         run: |
           if [ "${{ needs.test-matrix.result }}" != "success" ]; then
             echo "Unit tests failed"
+            exit 1
+          fi
+          if [ "${{ needs.test-python-3-14.result }}" != "success" ]; then
+            echo "Python 3.14 tests failed"
             exit 1
           fi
           if [ "${{ needs.test-apple-silicon.result }}" != "success" ]; then
