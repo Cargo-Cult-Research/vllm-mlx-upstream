@@ -41,6 +41,16 @@ export ANTHROPIC_API_KEY=not-needed
 claude
 ```
 
+## Coding CLI compatibility
+
+**Validated with OpenCode, pi, Codex, Claude Code, GitHub Copilot CLI, Cline CLI,
+and OpenClaw's embedded agent.** All seven completed a streamed tool interaction
+and an exact file edit in one local run with Qwen3.8-27B-4bit on September 19,
+2026. Results apply to the tested client versions and settings.
+
+See the [validated CLI matrix and setup guide](docs/guides/client-acceptance.md#validated-cli-versions)
+for versions, API transports, reproduction commands, and coverage limits.
+
 ## Features
 
 ### APIs
@@ -259,6 +269,7 @@ Browse the complete documentation at [vllm-mlx.is-a.dev](https://vllm-mlx.is-a.d
 
 - **Getting started**: [Installation](docs/getting-started/installation.md) · [Quick Start](docs/getting-started/quickstart.md)
 - **Servers & APIs**: [OpenAI server](docs/guides/server.md) · [Anthropic Messages API](docs/guides/server.md#anthropic-messages-api) · [Python API](docs/guides/python-api.md)
+- **Client compatibility**: [Run coding-client acceptance checks](docs/guides/client-acceptance.md)
 - **Features**: [Multimodal](docs/guides/multimodal.md) · [Audio](docs/guides/audio.md) · [Embeddings](docs/guides/embeddings.md) · [Reasoning](docs/guides/reasoning.md) · [MCP & Tool Calling](docs/guides/mcp-tools.md) · [Tool Parsers](docs/guides/tool-calling.md)
 - **Performance**: [Continuous Batching](docs/guides/continuous-batching.md) · [Multi-Model Serving](docs/guides/model-registry.md) · [Warm Prompts](docs/guides/warm-prompts.md) · [MoE Top-K](docs/guides/moe-top-k.md)
 - **Reference**: [CLI](docs/reference/cli.md) · [Models](docs/reference/models.md) · [Configuration](docs/reference/configuration.md)
